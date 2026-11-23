@@ -248,7 +248,7 @@ begin
 
     if v_coupon.discount_type = 'free_delivery' then
       v_delivery_discount := (v_order->>'shipping')::integer;
-      if v_delivery_discount <= 0 then raise exception 'This order already qualifies for free delivery'; end if;
+      if v_delivery_discount <= 0 then raise exception 'Free delivery is available only with an eligible free-delivery coupon'; end if;
       v_discount := 0;
     elsif v_coupon.discount_type = 'percent' then
       v_raw_discount := round((v_order->>'subtotal')::numeric * v_coupon.discount_value / 100)::integer;

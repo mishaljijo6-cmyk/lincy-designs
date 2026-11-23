@@ -3,6 +3,7 @@ const { findOrderByReceipt } = require('../lib/razorpay');
 const { markCaptured } = require('./razorpay-webhook');
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const CUSTOMER_ORDER_COLUMNS = 'id,order_number,customer_name,email,phone,address,city,state,pincode,customer_note,subtotal,gst_amount,shipping,total,payment_status,payment_provider,status,shipping_carrier,tracking_number,tracking_url,shipped_at,delivered_at,refund_status,refund_reason,refund_requested_at,refund_resolved_at,refund_admin_note,created_at,updated_at,coupon_code,discount_amount,delivery_discount';
 
 async function reconcilePayment(order) {
   if (!['pending', 'failed'].includes(order.payment_status) || order.payment_provider !== 'razorpay' || !process.env.RAZORPAY_KEY_ID || !process.env.RAZORPAY_KEY_SECRET) return order;
@@ -36,12 +37,11 @@ async function reconcilePayment(order) {
       for (const capture of captures) {
         await markCaptured(capture, gatewayOrderId);
       }
-      const current = await supabase(`store_orders?id=eq.${encodeURIComponent(order.id)}&select=*`);
+      const current = await supabase(`store_orders?id=eq.${encodeURIComponent(order.id)}&select=${CUSTOMER_ORDER_COLUMNS}`);
       return current?.[0] || order;
     }
-    const attemptsFailed = result.items.length > 0 && result.items.every(payment => payment.status === 'failed');
     const holdExpired = Date.now() - Date.parse(order.created_at || 0) >= 45 * 60 * 1000;
-    if (order.payment_status === 'pending' && (attemptsFailed || (result.items.length === 0 && holdExpired))) {
+    if (order.payment_status === 'pending' && holdExpired && result.items.every(payment => payment.status === 'failed')) {
       const released = await rpc('fail_checkout_order', { p_order_id: order.id, p_razorpay_order_id: gatewayOrderId });
       if (released) return { ...order, payment_status: 'failed' };
     }
@@ -74,8 +74,8 @@ module.exports = async function orders(req, res) {
     try {
       const requestedOrderId = String(req.query?.orderId || new URL(req.url, 'https://store.invalid').searchParams.get('orderId') || '');
       let orders = requestedOrderId
-        ? (UUID.test(requestedOrderId) ? await supabase(`store_orders?id=eq.${encodeURIComponent(requestedOrderId)}&user_id=eq.${encodeURIComponent(user.id)}&select=*&limit=1`) : [])
-        : await supabase(`store_orders?user_id=eq.${encodeURIComponent(user.id)}&select=*&order=created_at.desc&limit=50`);
+        ? (UUID.test(requestedOrderId) ? await supabase(`store_orders?id=eq.${encodeURIComponent(requestedOrderId)}&user_id=eq.${encodeURIComponent(user.id)}&select=${CUSTOMER_ORDER_COLUMNS}&limit=1`) : [])
+        : await supabase(`store_orders?user_id=eq.${encodeURIComponent(user.id)}&select=${CUSTOMER_ORDER_COLUMNS}&order=created_at.desc&limit=50`);
       if (requestedOrderId && !UUID.test(requestedOrderId)) return json(res, 400, { error: 'The order ID is invalid.' });
       if (!orders.length) return json(res, 200, { orders: [] });
       // Only reconcile a payment when the shopper explicitly checks one order.
@@ -85,7 +85,7 @@ module.exports = async function orders(req, res) {
       const items = ids.length ? await supabase(`store_order_items?order_id=in.(${ids.join(',')})&select=id,order_id,product_id,product_name,unit_price,quantity,gst_rate,gst_amount,selected_size,selected_color,image_url&order=id.asc`) : [];
       const itemsByOrder = new Map(orders.map(order => [order.id, []]));
       for (const item of items) itemsByOrder.get(item.order_id)?.push(item);
-      const safeOrders = orders.map(({ user_id, razorpay_order_id, ...order }) => ({ ...order, items: itemsByOrder.get(order.id) || [] }));
+      const safeOrders = orders.map(order => ({ ...order, items: itemsByOrder.get(order.id) || [] }));
       return json(res, 200, { orders: safeOrders, ...(requestedOrderId ? { order: safeOrders[0] } : {}) });
     } catch (error) {
       const updateRequired = error.status === 400 && /user_id|tracking_|refund_|column|schema cache/i.test(error.message || '');

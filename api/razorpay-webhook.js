@@ -1,14 +1,8 @@
 const { json, method, rpc, secureEqual, signature, supabase } = require('../lib/server');
 
 async function rawBody(req, limit = 1_000_000) {
-  if (Buffer.isBuffer(req.body)) {
-    if (req.body.length > limit) throw new Error('Payload too large.');
-    return req.body;
-  }
-  if (typeof req.body === 'string') {
-    if (Buffer.byteLength(req.body) > limit) throw new Error('Payload too large.');
-    return Buffer.from(req.body);
-  }
+  // Read the original request stream without touching req.body. Parsing the
+  // body first changes the bytes Razorpay signed and makes verification fail.
   const chunks = [];
   let size = 0;
   for await (const chunk of req) {
@@ -70,16 +64,12 @@ module.exports = async function razorpayWebhook(req, res) {
     }
 
     if (event.event === 'payment.failed' && payment?.order_id) {
-      const rows = await supabase(`store_orders?razorpay_order_id=eq.${encodeURIComponent(payment.order_id)}&select=id,payment_status`);
-      const order = rows?.[0];
-      if (order?.payment_status === 'pending') {
-        const payments = await paymentList(payment.order_id);
-        const captured = payments.find(item => item.status === 'captured');
-        if (captured) await markCaptured(captured, payment.order_id);
-        else if (payments.length && payments.every(item => item.status === 'failed')) {
-          await rpc('fail_checkout_order', { p_order_id: order.id, p_razorpay_order_id: payment.order_id });
-        }
-      }
+      // Razorpay permits another payment attempt on the same order. A failed
+      // attempt is not a failed store order and must not release its stock.
+      // Still look for a capture in case events arrived out of order.
+      const payments = await paymentList(payment.order_id);
+      const captured = payments.find(item => item.status === 'captured');
+      if (captured) await markCaptured(captured, payment.order_id);
       return json(res, 200, { received: true });
     }
 

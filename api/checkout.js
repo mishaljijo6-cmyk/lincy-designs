@@ -29,7 +29,7 @@ module.exports = async function checkout(req, res) {
   }
 
   let provider = input.provider === 'cod' ? 'cod' : 'razorpay';
-  const customer = input.customer || {};
+  const customer = { ...(input.customer || {}), note: String(input.customer?.note || '').trim().slice(0, 500) };
   const items = Array.isArray(input.items) ? input.items : [];
   const idempotencyKey = String(input.idempotencyKey || '').slice(0, 100);
   if (!idempotencyKey || !items.length || items.length > 20) return json(res, 400, { error: 'Your cart is empty or invalid.' });
@@ -69,15 +69,40 @@ module.exports = async function checkout(req, res) {
     return json(res, 503, { error: 'Online payment is temporarily unavailable. Please try again later.' });
   }
 
-  // Resolve the idempotent attempt before invoking the database RPC. The RPC
-  // deliberately rejects switching providers on a pending order; close and
-  // release that attempt here so the shopper can review and retry safely.
+  // Resolve the idempotent attempt before invoking the database RPC. Keep an
+  // open reservation attached to its original provider until payment is
+  // reconciled; a failed UPI attempt may still be retried on the same order.
   try {
-  const priorSelect = quote.couponCode ? 'id,user_id,payment_status,payment_provider,order_number,total,razorpay_order_id,razorpay_order_creation_token,coupon_code,discount_amount,delivery_discount' : 'id,user_id,payment_status,payment_provider,order_number,total,razorpay_order_id,razorpay_order_creation_token';
+  const priorSelect = quote.couponCode ? 'id,user_id,payment_status,payment_provider,order_number,total,created_at,razorpay_order_id,razorpay_order_creation_token,coupon_code,discount_amount,delivery_discount' : 'id,user_id,payment_status,payment_provider,order_number,total,created_at,razorpay_order_id,razorpay_order_creation_token';
     const priorRows = await supabase(`store_orders?idempotency_key=eq.${encodeURIComponent(idempotencyKey)}&select=${priorSelect}`);
     const prior = priorRows?.[0];
     if (prior && prior.user_id !== user.id) {
       return json(res, 409, { error: 'This checkout belongs to another account. Start again from your own bag.' });
+    }
+    if (prior?.payment_status === 'failed' && prior.payment_provider !== provider) {
+      return json(res, 409, { error: 'This expired reservation must be retried with its original payment method. Reopen Pay online or contact the store before choosing another method.' });
+    }
+    if (prior?.payment_status === 'failed' && prior.payment_provider === 'razorpay' && prior.razorpay_order_id) {
+      let payments;
+      try { payments = await listPayments(prior.razorpay_order_id); }
+      catch { return json(res, 503, { error: 'We could not confirm the earlier payment yet. Check My orders before trying again.' }); }
+      const captures = payments.filter(payment => payment.status === 'captured'
+        && payment.order_id === prior.razorpay_order_id
+        && payment.amount === Number(prior.total) * 100
+        && payment.currency === 'INR');
+      if (captures.length) {
+        let refundReview = false, refundReviewType = null;
+        for (const capture of captures) {
+          const outcome = await markCaptured(capture, prior.razorpay_order_id);
+          refundReview = outcome.refundReview || refundReview;
+          if (outcome.latePayment) refundReviewType = 'late';
+          else if (outcome.duplicatePayment) refundReviewType = 'duplicate';
+        }
+        return json(res, 200, { orderNumber: prior.order_number, storeOrderId: prior.id, payment: refundReview ? 'review' : 'paid', refundReview, refundReviewType, total: prior.total, ...quote });
+      }
+      if (payments.some(payment => payment.status !== 'failed')) {
+        return json(res, 409, { error: 'The earlier Razorpay order still has a payment in progress. Check My orders before retrying.' });
+      }
     }
     if (prior?.payment_status === 'pending' && prior.payment_provider !== provider) {
       if (prior.payment_provider === 'razorpay' && !prior.razorpay_order_id) {
@@ -101,13 +126,13 @@ module.exports = async function checkout(req, res) {
         if (!payments.length || payments.some(payment => !['failed'].includes(payment.status))) {
           return json(res, 409, { error: 'The earlier payment is still open. Finish it or wait for it to close, then check My orders before starting another payment.' });
         }
+        const holdExpired = Date.now() - Date.parse(prior.created_at || 0) >= 45 * 60 * 1000;
+        if (!holdExpired) {
+          return json(res, 409, { error: 'The online payment can still be retried for this order. Reopen Pay online to try again, or wait until the 45-minute reservation ends before changing payment methods.' });
+        }
       }
       const released = await rpc('fail_checkout_order', { p_order_id: prior.id, p_razorpay_order_id: null });
-      if (released) return json(res, 409, {
-        error: 'The earlier payment attempt has been closed. Review the updated total, then continue with your selected payment method.',
-        quote,
-        restartCheckout: true
-      });
+      if (released) return json(res, 409, { error: 'This payment reservation has ended. Reopen checkout and review your bag before placing another order.' });
       const latest = await supabase(`store_orders?id=eq.${encodeURIComponent(prior.id)}&select=order_number,payment_status,payment_reference,total`);
       if (latest?.[0]?.payment_status === 'paid') {
         return json(res, 200, { orderNumber: latest[0].order_number, storeOrderId: prior.id, payment: 'paid', total: latest[0].total });
@@ -132,9 +157,8 @@ module.exports = async function checkout(req, res) {
       if (payments.some(payment => ['created', 'authorized'].includes(payment.status))) {
         return json(res, 202, { orderNumber: prior.order_number, storeOrderId: prior.id, payment: 'pending', total: prior.total });
       }
-      if (payments.length && payments.every(payment => payment.status === 'failed')) {
-        await rpc('fail_checkout_order', { p_order_id: prior.id, p_razorpay_order_id: prior.razorpay_order_id });
-      }
+      // Failed Razorpay attempts do not close the order. Continue below with
+      // the same gateway order so the shopper can retry without losing stock.
     }
   } catch (error) {
     const updateRequired = error.status === 400 && /user_id|column|schema cache/i.test(error.message || '');
@@ -168,9 +192,7 @@ module.exports = async function checkout(req, res) {
         const priorRows = await supabase(`store_orders?idempotency_key=eq.${encodeURIComponent(idempotencyKey)}&select=id,user_id,payment_status`);
         const prior = priorRows?.[0];
         if (prior?.user_id && prior.user_id !== user.id) return json(res, 409, { error: 'This checkout belongs to another account. Start again from your own bag.' });
-        if (prior?.payment_status === 'pending' && await rpc('fail_checkout_order', { p_order_id: prior.id, p_razorpay_order_id: null })) {
-          return json(res, 409, { error: 'The earlier payment attempt has been closed. Review the updated total, then continue again.', quote, restartCheckout: true });
-        }
+        if (prior?.payment_status === 'pending') return json(res, 409, { error: 'The earlier checkout is still reserving this order. Continue with its existing payment method or check My orders before restarting.' });
       } catch { /* use the safe retry response below */ }
       return json(res, 409, { error: 'The earlier checkout is still being confirmed. Please retry in a moment.' });
     }
@@ -213,35 +235,7 @@ module.exports = async function checkout(req, res) {
     payment: 'cod'
   });
   if (order.payment_status === 'pending' && order.payment_provider !== provider) {
-    let released = false;
-    try {
-      released = await rpc('fail_checkout_order', { p_order_id: order.id, p_razorpay_order_id: null });
-    } catch {
-      return json(res, 503, { error: 'An earlier checkout is still reserving this order. Please retry in a moment or contact the store.' });
-    }
-    if (released) {
-      return json(res, 409, {
-        error: 'We closed the earlier payment attempt. Review your total, then continue with the selected payment method.',
-        quote,
-        restartCheckout: true
-      });
-    }
-    try {
-      const latest = await supabase(`store_orders?id=eq.${encodeURIComponent(order.id)}&select=order_number,payment_status,payment_reference`);
-      if (latest?.[0]?.payment_status === 'paid') {
-        return json(res, 200, { orderNumber: latest[0].order_number, payment: 'paid', total: order.total });
-      }
-      if (latest?.[0]?.payment_status === 'failed') {
-        return json(res, 409, {
-          error: 'The earlier attempt has ended. Review your total, then continue with the selected payment method.',
-          quote,
-          restartCheckout: true
-        });
-      }
-    } catch {
-      return json(res, 503, { error: 'We could not confirm the earlier checkout status. Please check your orders before trying again.' });
-    }
-    return json(res, 409, { error: 'This order is still being processed. Please wait before trying another payment method.' });
+    return json(res, 409, { error: 'This order is still reserved with its original payment method. Reopen that payment or check My orders before starting another method.' });
   }
   if (order.payment_status !== 'pending') {
     return json(res, 409, {

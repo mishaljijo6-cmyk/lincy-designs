@@ -46,7 +46,7 @@ async function reconcile(order) {
   if (order.payment_status !== 'pending') return false;
   const expired = Date.now() - Date.parse(order.created_at) >= 45 * 60 * 1000;
   const allFailed = payments.length > 0 && payments.every(payment => payment.status === 'failed');
-  if (allFailed || (!payments.length && expired)) {
+  if (expired && (allFailed || !payments.length)) {
     return await rpc('fail_checkout_order', { p_order_id: order.id, p_razorpay_order_id: order.razorpay_order_id });
   }
   return false;
@@ -61,12 +61,11 @@ module.exports = async function cronReconcile(req, res) {
 
   try {
     const cutoff = encodeURIComponent(new Date(Date.now() - 45 * 60 * 1000).toISOString());
-    const recent = encodeURIComponent(new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString());
-    const [pending, failed] = await Promise.all([
-      supabase(`store_orders?payment_status=eq.pending&payment_provider=eq.razorpay&created_at=lt.${cutoff}&select=id,order_number,created_at,total,payment_status,razorpay_order_id&order=created_at.desc&limit=10`),
-      supabase(`store_orders?payment_status=eq.failed&payment_provider=eq.razorpay&created_at=gte.${recent}&select=id,order_number,created_at,total,payment_status,razorpay_order_id&order=created_at.desc&limit=5`)
-    ]);
-    const results = await Promise.allSettled([...pending, ...failed].map(reconcile));
+    const pending = await supabase(`store_orders?payment_status=eq.pending&payment_provider=eq.razorpay&created_at=lt.${cutoff}&select=id,order_number,created_at,total,payment_status,razorpay_order_id&order=created_at.asc&limit=25`);
+    // Failed reservations are reconciled on demand by /api/orders and through
+    // captured-payment webhooks. A fixed recent slice here would starve older
+    // holds and repeatedly spend provider calls on the same rows.
+    const results = await Promise.allSettled(pending.map(reconcile));
     const reconciled = results.filter(result => result.status === 'fulfilled' && result.value).length;
     const errors = results.filter(result => result.status === 'rejected').length;
     return json(res, errors ? 207 : 200, { checked: results.length, reconciled, errors });

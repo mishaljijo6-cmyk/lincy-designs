@@ -29,6 +29,7 @@ create table if not exists public.store_orders (
  idempotency_key text unique,
  customer_name text not null,
  email text not null,
+ customer_note text not null default '',
  phone text not null,
  address text not null,
  city text not null,
@@ -60,6 +61,7 @@ alter table public.store_orders add column if not exists idempotency_key text;
 alter table public.store_orders add column if not exists razorpay_order_id text;
 alter table public.store_orders add column if not exists gst_amount integer not null default 0;
 alter table public.store_orders add column if not exists updated_at timestamptz not null default now();
+alter table public.store_orders add column if not exists customer_note text not null default '';
 alter table public.store_orders add column if not exists user_id uuid references auth.users(id) on delete set null;
 alter table public.store_orders add column if not exists shipping_carrier text;
 alter table public.store_orders add column if not exists tracking_number text;
@@ -152,7 +154,8 @@ using ((auth.jwt() ->> 'email') = 'mishalmj03@gmail.com');
 
 grant select on public.store_products to anon, authenticated;
 grant insert,update,delete on public.store_products to authenticated;
-grant select,update on public.store_orders to authenticated;
+revoke update on public.store_orders from public,anon,authenticated;
+grant select on public.store_orders to authenticated;
 grant select on public.store_order_items, public.store_subscribers to authenticated;
 grant all on public.store_products, public.store_orders, public.store_order_items, public.store_subscribers to service_role;
 
@@ -175,11 +178,13 @@ declare
   v_customer_name text := trim(coalesce(p_customer->>'name',''));
   v_email text := lower(trim(coalesce(p_customer->>'email','')));
   v_phone text := trim(coalesce(p_customer->>'phone',''));
+  v_customer_note text := trim(coalesce(p_customer->>'note',''));
 begin
   if p_provider not in ('razorpay','cod') then raise exception 'Invalid payment method'; end if;
   if p_user_id is null then raise exception 'A signed-in customer is required'; end if;
   if jsonb_typeof(p_items) <> 'array' or jsonb_array_length(p_items) < 1 or jsonb_array_length(p_items) > 20 then raise exception 'Invalid items'; end if;
   if length(v_customer_name) not between 2 and 100 or v_email !~* '^[^@ ]+@[^@ ]+\.[^@ ]+$' or v_phone !~ '^[0-9+() -]{10,20}$' then raise exception 'Invalid customer details'; end if;
+  if length(v_customer_note) > 500 then raise exception 'Order note is too long'; end if;
   if length(trim(coalesce(p_customer->>'address',''))) not between 4 and 300
     or length(trim(coalesce(p_customer->>'city',''))) not between 2 and 100
     or length(trim(coalesce(p_customer->>'state',''))) not between 2 and 100
@@ -190,13 +195,18 @@ begin
     if found then
       if v_order.user_id is not null and v_order.user_id <> p_user_id then raise exception 'This checkout belongs to another account'; end if;
       if v_order.payment_status = 'failed' then
+        if v_order.payment_provider is distinct from p_provider then raise exception 'An expired order must be retried with its original payment method'; end if;
         for v_line in select product_id,quantity from public.store_order_items where order_id=v_order.id and product_id is not null order by product_id loop
           select * into v_product from public.store_products where id=v_line.product_id and active=true for update;
           if not found or v_product.stock < v_line.quantity then raise exception 'A selected product is no longer available in the requested quantity'; end if;
           update public.store_products set stock=stock-v_line.quantity where id=v_product.id;
         end loop;
         update public.store_orders set payment_status=case when p_provider='cod' then 'cod' else 'pending' end,
-          payment_provider=p_provider,razorpay_order_id=null,payment_reference=null,user_id=p_user_id where id=v_order.id;
+          payment_provider=p_provider,razorpay_order_id=case when p_provider='razorpay' then v_order.razorpay_order_id else null end,payment_reference=null,user_id=p_user_id where id=v_order.id;
+        select * into v_order from public.store_orders where id=v_order.id;
+      end if;
+      if v_order.payment_status = 'pending' then
+        update public.store_orders set customer_note=v_customer_note where id=v_order.id;
         select * into v_order from public.store_orders where id=v_order.id;
       end if;
       return jsonb_build_object('id',v_order.id,'order_number',v_order.order_number,'subtotal',v_order.subtotal,'gst_amount',v_order.gst_amount,'total',v_order.total,'shipping',v_order.shipping,'payment_status',v_order.payment_status,'payment_provider',v_order.payment_provider,'razorpay_order_id',v_order.razorpay_order_id);
@@ -219,10 +229,10 @@ begin
     v_count := v_count + 1;
   end loop;
   if v_count <> jsonb_array_length(p_items) then raise exception 'Invalid product list'; end if;
-  v_shipping := case when v_subtotal >= 2499 then 0 else 99 end;
+  v_shipping := 99;
   v_number := 'LD-' || to_char(now(),'YYMMDD') || '-' || upper(substr(replace(gen_random_uuid()::text,'-',''),1,6));
-  insert into public.store_orders(user_id,order_number,idempotency_key,customer_name,email,phone,address,city,state,pincode,subtotal,gst_amount,shipping,total,payment_status,payment_provider)
-  values(p_user_id,v_number,p_idempotency_key,v_customer_name,v_email,v_phone,trim(p_customer->>'address'),trim(p_customer->>'city'),trim(p_customer->>'state'),trim(p_customer->>'pincode'),v_subtotal,v_gst_amount,v_shipping,v_subtotal+v_shipping,case when p_provider='cod' then 'cod' else 'pending' end,p_provider)
+  insert into public.store_orders(user_id,order_number,idempotency_key,customer_name,email,customer_note,phone,address,city,state,pincode,subtotal,gst_amount,shipping,total,payment_status,payment_provider)
+  values(p_user_id,v_number,p_idempotency_key,v_customer_name,v_email,v_customer_note,v_phone,trim(p_customer->>'address'),trim(p_customer->>'city'),trim(p_customer->>'state'),trim(p_customer->>'pincode'),v_subtotal,v_gst_amount,v_shipping,v_subtotal+v_shipping,case when p_provider='cod' then 'cod' else 'pending' end,p_provider)
   returning id into v_order_id;
   for v_item in select value from jsonb_array_elements(p_items) loop
     select * into v_product from public.store_products where id = v_item->>'productId';

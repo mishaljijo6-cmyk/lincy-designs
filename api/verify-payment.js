@@ -5,7 +5,8 @@ async function razorpayFetch(path) {
   const response = await fetch(`https://api.razorpay.com/v1/${path}`, {
     headers: {
       Authorization: `Basic ${Buffer.from(`${process.env.RAZORPAY_KEY_ID}:${process.env.RAZORPAY_KEY_SECRET}`).toString('base64')}`
-    }
+    },
+    signal: AbortSignal.timeout(10000)
   });
   const result = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error('Razorpay payment status check failed.');
