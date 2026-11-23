@@ -489,7 +489,7 @@ begin
   if not found then return false; end if;
   if p_refund_status=v_order.refund_status then return true; end if;
   if p_refund_status='requested' and v_order.refund_status not in ('none','rejected') then raise exception 'This refund request is already being reviewed'; end if;
-  if p_refund_status in ('approved','rejected') and v_order.refund_status<>'requested' then raise exception 'Review the customer's current refund request first'; end if;
+  if p_refund_status in ('approved','rejected') and v_order.refund_status<>'requested' then raise exception 'Review the customer''s current refund request first'; end if;
   if p_refund_status='processed' then
     if not p_confirm_refund then raise exception 'Confirm that you sent the refund first'; end if;
     if v_order.refund_status not in ('requested','approved') then raise exception 'Approve or request a refund before marking it processed'; end if;
