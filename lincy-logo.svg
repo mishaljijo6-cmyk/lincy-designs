@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 420 104" role="img" aria-labelledby="title desc">
+  <title id="title">Lincy Designs</title>
+  <desc id="desc">Lincy Designs womenswear</desc>
+  <g transform="translate(8 8)" fill="none" stroke="#a55739" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="44" cy="44" r="40" stroke="#d9c5a7" stroke-width="1.5"/>
+    <path d="M44 17c8 8 12 17 12 27-4 5-8 8-12 9-5-1-9-4-13-9 0-10 4-19 13-27Z" fill="#f6f1e8" stroke-width="2"/>
+    <path d="M44 25v35M25 39c6-8 12-12 20-12-2 8-6 14-14 17m33-5c-6-8-12-12-20-12 2 8 6 14 14 17M24 68h40" stroke-width="1.8"/>
+    <path d="m30 73 6 4m26-4-6 4" stroke="#c29b55" stroke-width="2.2"/>
+  </g>
+  <text x="112" y="57" fill="#25251f" font-family="Georgia,'Times New Roman',serif" font-size="46" letter-spacing="3">LINCY</text>
+  <path d="M115 70h267" stroke="#d9c5a7" stroke-width="1"/>
+  <text x="115" y="89" fill="#a55739" font-family="Arial,sans-serif" font-size="13" letter-spacing="7">DESIGNS</text>
+</svg>

@@ -1,0 +1,9 @@
+{
+  "brand": "LINCY DESIGNS",
+  "supportEmail": "mishalmj03@gmail.com",
+  "supabaseProjectId": "fszzfniakuwiuzupfcue",
+  "supabaseUrl": "https://fszzfniakuwiuzupfcue.supabase.co",
+  "supabasePublishableKey": "sb_publishable_…",
+  "paymentProvider": "Razorpay",
+  "razorpayKeyIdEnvironmentVariable": "RAZORPAY_KEY_ID"
+}
