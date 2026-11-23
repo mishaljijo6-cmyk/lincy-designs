@@ -711,14 +711,14 @@ begin
           end loop;
           update public.store_orders set stock_released_at=null where id=v_order.id;
         end if;
-        update public.store_orders set payment_status=case when p_provider='cod' then 'cod' else 'pending' end,
+        update public.store_orders set payment_status=case when p_provider='cod' then 'cod' else 'pending' end,status='new',
           customer_note=v_customer_note,payment_provider=p_provider,
           razorpay_order_id=case when p_provider='razorpay' then v_order.razorpay_order_id else null end,
           payment_reference=null,gateway_amount_paise=null
         where id=v_order.id;
         select * into v_order from public.store_orders where id=v_order.id;
       end if;
-      if v_order.payment_status='pending' then
+      if v_order.payment_status='pending' and v_order.status='new' then
         update public.store_orders set customer_note=v_customer_note where id=v_order.id;
         select * into v_order from public.store_orders where id=v_order.id;
       end if;

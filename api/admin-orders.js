@@ -6,6 +6,10 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-
 const STATUSES = new Set(['new', 'processing', 'packed', 'shipped', 'out_for_delivery', 'delivered', 'complete', 'cancelled']);
 const REFUNDS = new Set(['none', 'requested', 'approved', 'rejected', 'processed']);
 
+function canRetryRefund(providerStatus) {
+  return providerStatus === 'failed';
+}
+
 module.exports = async function adminOrders(req, res) {
   if (!method(req, res, ['PATCH'])) return;
   if (!supabaseReady()) return json(res, 503, { error: 'Order updates are temporarily unavailable.' });
@@ -46,7 +50,7 @@ module.exports = async function adminOrders(req, res) {
     if (!STATUSES.has(status)) return json(res, 400, { error: 'Choose a valid order status.' });
     let current;
     try {
-      const rows = await supabase(`store_orders?id=eq.${encodeURIComponent(orderId)}&select=id,status,payment_status,refund_status`);
+      const rows = await supabase(`store_orders?id=eq.${encodeURIComponent(orderId)}&select=id,status,payment_status,refund_status,refund_amount_paise,total`);
       current = rows?.[0];
     } catch { return json(res, 503, { error: 'Order status could not be checked. Please try again.' }); }
     if (!current) return json(res, 404, { error: 'Order not found.' });
@@ -68,6 +72,17 @@ module.exports = async function adminOrders(req, res) {
         currentStatus: current.status,
         allowedStatuses: nextStatuses
       });
+    }
+    const fullyRefunded = current.payment_status === 'refunded'
+      || (current.refund_status === 'processed' && Number(current.refund_amount_paise || 0) >= Math.round(Number(current.total || 0) * 100));
+    if (status !== 'cancelled' && fullyRefunded) {
+      return json(res, 409, { error: 'This order has been refunded and cannot move into fulfilment.' });
+    }
+    if (status !== 'cancelled' && !['paid', 'cod'].includes(current.payment_status)) {
+      return json(res, 409, { error: 'This order cannot move into fulfilment until its payment is confirmed.' });
+    }
+    if (status !== 'cancelled' && ['requested', 'approved'].includes(current.refund_status)) {
+      return json(res, 409, { error: 'Resolve the open refund request before changing fulfilment.' });
     }
     if (['shipped', 'out_for_delivery', 'delivered', 'complete'].includes(status) && !['paid', 'cod'].includes(current.payment_status)) {
       return json(res, 409, { error: 'This order cannot ship until its payment is confirmed.' });
@@ -235,7 +250,7 @@ module.exports = async function adminOrders(req, res) {
             if (existing.payment_id !== paymentId || Number(existing.amount) !== amountPaise) {
               return json(res, 409, { error: 'The saved Razorpay refund does not match this request. Review it in Razorpay before making another refund.' });
             }
-            if (existing.status !== 'failed') {
+            if (!canRetryRefund(existing.status)) {
               const updated = await saveRazorpayRefund(current, paymentId, existing, note, previousRefundId, current.refund_attempt_key || null);
               return json(res, 200, { saved: true, refundId: existing.id, refundStatus: existing.status, amountPaise, alreadySubmitted: true, ...updated });
             }
@@ -359,6 +374,8 @@ module.exports = async function adminOrders(req, res) {
     });
   }
 };
+
+module.exports.canRetryRefund = canRetryRefund;
 
 async function saveRazorpayRefund(order, paymentId, refund, adminNote, previousRefundId = null, attemptKey = null) {
   const ledgerAttemptKey = attemptKey || createHash('sha256').update(`${order.id}:${paymentId}:${refund.id || refund.amount}`).digest('hex').slice(0, 32);

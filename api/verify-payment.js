@@ -2,6 +2,14 @@ const { authenticatedUser, body, json, method, rpc, secureEqual, signature, supa
 const { paymentAmountMatchesOrder } = require('../lib/razorpay');
 const { markCaptured } = require('./razorpay-webhook');
 
+function paymentAlreadyConfirmed(order, paymentId) {
+  return order?.payment_status === 'paid' && order.payment_reference === paymentId;
+}
+
+function paymentAlreadyRefunded(order, paymentId) {
+  return order?.payment_status === 'refunded' && order.payment_reference === paymentId;
+}
+
 async function razorpayFetch(path) {
   const response = await fetch(`https://api.razorpay.com/v1/${path}`, {
     headers: {
@@ -42,7 +50,7 @@ module.exports = async function verifyPayment(req, res) {
   try {
     let rows;
     try {
-      rows = await supabase(`store_orders?id=eq.${encodeURIComponent(storeOrderId)}&select=id,user_id,order_number,total,payment_status,razorpay_order_id,payment_reference,coupon_code,gateway_amount_paise`);
+      rows = await supabase(`store_orders?id=eq.${encodeURIComponent(storeOrderId)}&select=id,user_id,order_number,total,payment_status,refund_status,refund_amount_paise,razorpay_order_id,payment_reference,coupon_code,gateway_amount_paise`);
     } catch (error) {
       if (error.status === 400 && /user_id|column|schema cache/i.test(error.message || '')) {
         return json(res, 503, { error: 'Payment confirmation is temporarily unavailable. Do not pay again yet; check My orders shortly.' });
@@ -52,7 +60,10 @@ module.exports = async function verifyPayment(req, res) {
     const order = rows?.[0];
     if (!order || !order.razorpay_order_id) return json(res, 404, { error: 'We could not match this payment to your order.' });
     if (order.user_id !== user.id) return json(res, 403, { error: 'This order belongs to a different account.' });
-    if (['paid', 'refunded'].includes(order.payment_status) && order.payment_reference === paymentId) {
+    if (paymentAlreadyRefunded(order, paymentId)) {
+      return json(res, 200, { verified: false, status: 'refunded', orderNumber: order.order_number, storeOrderId: order.id, total: order.total, gatewayAmountPaise: order.gateway_amount_paise, refundStatus: order.refund_status, refundAmountPaise: order.refund_amount_paise });
+    }
+    if (paymentAlreadyConfirmed(order, paymentId)) {
       return json(res, 200, { verified: true, orderNumber: order.order_number, storeOrderId: order.id, total: order.total, gatewayAmountPaise: order.gateway_amount_paise });
     }
 
@@ -78,7 +89,10 @@ module.exports = async function verifyPayment(req, res) {
     }
     if (!recorded.updated && !recorded.duplicate) {
       const current = await supabase(`store_orders?id=eq.${encodeURIComponent(storeOrderId)}&select=payment_status,payment_reference`);
-      if (!['paid', 'refunded'].includes(current?.[0]?.payment_status) || current[0].payment_reference !== paymentId) {
+      if (paymentAlreadyRefunded(current?.[0], paymentId)) {
+        return json(res, 200, { verified: false, status: 'refunded', orderNumber: order.order_number, storeOrderId: order.id, total: order.total, gatewayAmountPaise: order.gateway_amount_paise, refundStatus: order.refund_status, refundAmountPaise: order.refund_amount_paise });
+      }
+      if (!paymentAlreadyConfirmed(current?.[0], paymentId)) {
         return json(res, 202, { verified: false, status: 'pending', orderNumber: order.order_number, storeOrderId: order.id, total: order.total });
       }
     }
@@ -87,3 +101,6 @@ module.exports = async function verifyPayment(req, res) {
     return json(res, 502, { error: 'We received your payment response but could not confirm it yet. Please try again shortly.' });
   }
 };
+
+module.exports.paymentAlreadyConfirmed = paymentAlreadyConfirmed;
+module.exports.paymentAlreadyRefunded = paymentAlreadyRefunded;

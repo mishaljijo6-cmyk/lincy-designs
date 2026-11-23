@@ -1,12 +1,12 @@
 const { authenticatedUser, body, json, method, rpc, supabase, supabaseReady } = require('../lib/server');
 const { calculateQuote } = require('../lib/coupons');
 const {
-  customerConvenienceFeePaise,
+  checkoutFeePaise,
+  checkoutGatewayAmountPaise,
   findOrderByReceipt,
   getOrder,
   listPayments,
-  paymentAmountMatchesOrder,
-  razorpayOrderAmountPaise
+  paymentAmountMatchesOrder
 } = require('../lib/razorpay');
 const { markCaptured } = require('./razorpay-webhook');
 
@@ -35,6 +35,31 @@ function normalizedCheckoutLines(lines) {
 
 function sameCheckoutLines(left, right) {
   return JSON.stringify(normalizedCheckoutLines(left)) === JSON.stringify(normalizedCheckoutLines(right));
+}
+
+function checkoutCustomerPatch(customer) {
+  return {
+    customer_name: String(customer.name || '').trim().slice(0, 100),
+    email: String(customer.email || '').trim().toLowerCase().slice(0, 200),
+    customer_note: String(customer.note || '').trim().slice(0, 500),
+    phone: customer.phone,
+    address: String(customer.address || '').trim().slice(0, 300),
+    city: String(customer.city || '').trim().slice(0, 100),
+    state: String(customer.state || '').trim().slice(0, 100),
+    pincode: String(customer.pincode || '').trim()
+  };
+}
+
+function checkoutCustomerMatches(saved, customer) {
+  const expected = checkoutCustomerPatch(customer);
+  return String(saved.customer_name || '').trim() === expected.customer_name
+    && String(saved.email || '').trim().toLowerCase() === expected.email
+    && String(saved.customer_note || '').trim() === expected.customer_note
+    && String(saved.phone || '').trim() === expected.phone
+    && String(saved.address || '').trim() === expected.address
+    && String(saved.city || '').trim() === expected.city
+    && String(saved.state || '').trim() === expected.state
+    && String(saved.pincode || '').trim() === expected.pincode;
 }
 
 function checkoutHoldExpired(createdAt) {
@@ -157,8 +182,8 @@ module.exports = async function checkout(req, res) {
   if (provider === 'razorpay' && quote.total > 0 && (!process.env.RAZORPAY_KEY_ID || !process.env.RAZORPAY_KEY_SECRET)) {
     return json(res, 503, { error: 'Online payment is temporarily unavailable. Please try again later.' });
   }
-  const onlineFeePaise = provider === 'razorpay' ? customerConvenienceFeePaise(quote.total) : 0;
-  const expectedRazorpayAmount = provider === 'razorpay' ? razorpayOrderAmountPaise(quote.total) : 0;
+  const onlineFeePaise = checkoutFeePaise(quote.total, provider);
+  const expectedRazorpayAmount = checkoutGatewayAmountPaise(quote.total, provider);
 
   // Resolve the idempotent attempt before invoking the database RPC. Keep an
   // open reservation attached to its original provider until payment is
@@ -387,7 +412,7 @@ module.exports = async function checkout(req, res) {
   // The checkout RPC binds ownership atomically. Verify the saved cart and
   // total before returning a success response for an idempotent replay.
   try {
-    const savedRows = await supabase(`store_orders?id=eq.${encodeURIComponent(order.id)}&select=id,user_id,payment_status,payment_provider,customer_name,email,phone,address,city,state,pincode,subtotal,gst_amount,shipping,total,gateway_amount_paise,coupon_code,discount_amount,delivery_discount`);
+    const savedRows = await supabase(`store_orders?id=eq.${encodeURIComponent(order.id)}&select=id,user_id,payment_status,payment_provider,status,customer_name,email,customer_note,phone,address,city,state,pincode,subtotal,gst_amount,shipping,total,gateway_amount_paise,coupon_code,discount_amount,delivery_discount,refund_status,refund_amount_paise`);
     const saved = savedRows?.[0];
     if (!saved?.user_id || saved.user_id !== user.id) {
       return json(res, 409, { error: 'This checkout belongs to a different account. Start checkout again from your own bag.' });
@@ -417,28 +442,21 @@ module.exports = async function checkout(req, res) {
       });
     }
 
-    const customerMatches = String(saved.customer_name || '').trim() === String(customer.name || '').trim()
-      && String(saved.email || '').trim().toLowerCase() === String(customer.email || '').trim().toLowerCase()
-      && String(saved.phone || '').trim() === customer.phone
-      && String(saved.address || '').trim() === String(customer.address || '').trim()
-      && String(saved.city || '').trim() === String(customer.city || '').trim()
-      && String(saved.state || '').trim() === String(customer.state || '').trim()
-      && String(saved.pincode || '').trim() === String(customer.pincode || '').trim();
+    const customerMatches = checkoutCustomerMatches(saved, customer);
     if (['paid', 'cod'].includes(saved.payment_status) && !customerMatches) {
-      return json(res, 409, { error: 'This order is already confirmed with its saved delivery address. Open My orders or contact the store to update it.' });
+      return json(res, 409, { error: 'This order is already confirmed with its saved delivery details. Open My orders or contact the store to update them.' });
     }
     if (saved.payment_status === 'pending' && !customerMatches) {
-      const updated = await supabase(`store_orders?id=eq.${encodeURIComponent(order.id)}&user_id=eq.${encodeURIComponent(user.id)}&payment_status=eq.pending&payment_provider=eq.${encodeURIComponent(provider)}`, {
+      // Updating address/note is safe only while the reservation is still new
+      // and pending. The conditional PATCH re-checks the row after acquiring
+      // its database lock, so a simultaneous payment confirmation wins and
+      // cannot have confirmed delivery details overwritten by this retry.
+      if (saved.status !== 'new') {
+        return json(res, 409, { error: 'Delivery details can no longer be changed on this checkout. Check My orders before continuing.' });
+      }
+      const updated = await supabase(`store_orders?id=eq.${encodeURIComponent(order.id)}&user_id=eq.${encodeURIComponent(user.id)}&payment_status=eq.pending&payment_provider=eq.${encodeURIComponent(provider)}&status=eq.new`, {
         method: 'PATCH', headers: { Prefer: 'return=representation' },
-        body: JSON.stringify({
-          customer_name: String(customer.name || '').trim().slice(0, 100),
-          email: String(customer.email || '').trim().toLowerCase().slice(0, 200),
-          phone: customer.phone,
-          address: String(customer.address || '').trim().slice(0, 300),
-          city: String(customer.city || '').trim().slice(0, 100),
-          state: String(customer.state || '').trim().slice(0, 100),
-          pincode: String(customer.pincode || '').trim()
-        })
+        body: JSON.stringify(checkoutCustomerPatch(customer))
       });
       if (!updated?.length) {
         return json(res, 409, { error: 'The order status changed while saving your delivery details. Check My orders before continuing.' });
@@ -452,11 +470,11 @@ module.exports = async function checkout(req, res) {
   // still verified below from the live catalog; GST is calculated server-side
   // for the buyer. Once the GST migration is applied, also verify its stored
   // value to catch stale database functions.
-  if (order.payment_status === 'paid') {
+  if (['paid', 'refunded'].includes(order.payment_status)) {
     if (order.payment_provider !== (quote.total === 0 ? 'coupon' : provider)) {
       return json(res, 409, { error: 'This checkout was already completed using a different payment method. Open My orders to review it.' });
     }
-    return json(res, 200, { orderNumber: order.order_number, storeOrderId: order.id, payment: Number(order.total) === 0 && order.payment_provider === 'coupon' ? 'free' : 'paid', total: order.total, gatewayAmountPaise: saved.gateway_amount_paise, ...quote });
+    return json(res, 200, { orderNumber: order.order_number, storeOrderId: order.id, payment: order.payment_status === 'refunded' ? 'refunded' : Number(order.total) === 0 && order.payment_provider === 'coupon' ? 'free' : 'paid', total: order.total, gatewayAmountPaise: saved.gateway_amount_paise, refundStatus: saved.refund_status, refundAmountPaise: saved.refund_amount_paise, ...quote });
   }
   if (order.payment_status === 'cod') {
     if (order.payment_provider !== 'cod' || provider !== 'cod') {
@@ -638,3 +656,5 @@ module.exports = async function checkout(req, res) {
 };
 
 module.exports.sameCheckoutLines = sameCheckoutLines;
+module.exports.checkoutCustomerPatch = checkoutCustomerPatch;
+module.exports.checkoutCustomerMatches = checkoutCustomerMatches;

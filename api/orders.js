@@ -6,7 +6,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-
 // Keep the customer response on columns guaranteed by the deployed order
 // migration. customer_note is optional in older live schemas and must not make
 // the entire order history unavailable when that optional column is absent.
-const CUSTOMER_ORDER_COLUMNS = 'id,order_number,customer_name,email,phone,address,city,state,pincode,subtotal,gst_amount,shipping,total,gateway_amount_paise,payment_status,payment_provider,status,shipping_carrier,tracking_number,tracking_url,shipped_at,delivered_at,refund_status,refund_reason,refund_requested_at,refund_resolved_at,created_at,updated_at,coupon_code,discount_amount,delivery_discount';
+const CUSTOMER_ORDER_COLUMNS = 'id,order_number,customer_name,email,phone,address,city,state,pincode,subtotal,gst_amount,shipping,total,gateway_amount_paise,payment_status,payment_provider,status,shipping_carrier,tracking_number,tracking_url,shipped_at,delivered_at,refund_status,refund_reason,refund_admin_note,refund_amount_paise,refund_reference,refund_payment_reference,refund_requested_at,refund_resolved_at,created_at,updated_at,coupon_code,discount_amount,delivery_discount';
 
 async function reconcilePayment(order) {
   if (!['pending', 'failed'].includes(order.payment_status) || order.payment_provider !== 'razorpay' || !process.env.RAZORPAY_KEY_ID || !process.env.RAZORPAY_KEY_SECRET) return order;
