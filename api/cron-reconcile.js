@@ -1,23 +1,12 @@
 const { json, method, rpc, secureEqual, supabase } = require('../lib/server');
-const { findOrderByReceipt, paymentAmountMatchesOrder } = require('../lib/razorpay');
+const { findOrderByReceipt, listPayments, paymentAmountMatchesOrder, razorpayOrderAmountPaise } = require('../lib/razorpay');
 const { markCaptured } = require('./razorpay-webhook');
-
-async function paymentsFor(gatewayOrderId) {
-  const authorization = `Basic ${Buffer.from(`${process.env.RAZORPAY_KEY_ID}:${process.env.RAZORPAY_KEY_SECRET}`).toString('base64')}`;
-  const response = await fetch(`https://api.razorpay.com/v1/orders/${encodeURIComponent(gatewayOrderId)}/payments`, {
-    headers: { Authorization: authorization },
-    signal: AbortSignal.timeout(7000)
-  });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok || !Array.isArray(data.items)) throw new Error('Could not retrieve the order payments.');
-  return data.items;
-}
 
 async function reconcile(order) {
   if (!order.razorpay_order_id) {
     if (!['pending', 'failed'].includes(order.payment_status) || !order.order_number) return false;
     const recovered = await findOrderByReceipt(order.order_number, {
-      amount: Number(order.total) * 100, currency: 'INR', storeOrderId: order.id
+      amounts: [Number(order.total) * 100, razorpayOrderAmountPaise(order.total)], currency: 'INR', storeOrderId: order.id
     });
     if (recovered) {
       const linked = await supabase(`store_orders?id=eq.${encodeURIComponent(order.id)}&payment_status=eq.${encodeURIComponent(order.payment_status)}&razorpay_order_id=is.null`, {
@@ -33,7 +22,7 @@ async function reconcile(order) {
     }
     return false;
   }
-  const payments = await paymentsFor(order.razorpay_order_id);
+  const payments = await listPayments(order.razorpay_order_id);
   const captures = payments.filter(payment => payment.status === 'captured'
     && payment.order_id === order.razorpay_order_id
     && paymentAmountMatchesOrder(payment.amount, order.total)

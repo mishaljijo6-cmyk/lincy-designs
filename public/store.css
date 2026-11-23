@@ -282,6 +282,15 @@ footer{display:block;padding:0 6%;background:#f8f4ec}
 
 .cart-stock-warning{display:block;color:#a3472f;font-size:11px;margin-top:6px}
 
+.admin-payment-ledger{display:grid;gap:10px;margin-top:14px}
+.admin-payment-capture{display:grid;grid-template-columns:minmax(0,1fr) minmax(190px,.55fr);gap:12px;align-items:start;padding:12px;border:1px solid var(--line);background:#fffdf9}
+.admin-payment-capture>div{display:grid;gap:4px;min-width:0;overflow-wrap:anywhere}
+.admin-capture-refund-form{display:grid;gap:7px;min-width:0}
+.admin-capture-refund-form label{display:grid;gap:5px;font-size:10px;font-weight:600}
+.admin-capture-refund-form input{box-sizing:border-box;width:100%;min-width:0;min-height:40px;padding:8px 10px;border:1px solid var(--line);background:#fff;color:var(--ink);font:12px var(--sans)}
+.admin-capture-refund-form .button{justify-self:start;min-height:40px;padding:9px 12px;font-size:10px}
+@media(max-width:650px){.admin-payment-capture{grid-template-columns:minmax(0,1fr);gap:8px;padding:10px}.admin-capture-refund-form{width:100%}.admin-capture-refund-form .button{width:100%}}
+
 /* Mobile viewport and checkout safeguards. These rules intentionally follow
    the older responsive declarations so later desktop refinements cannot
    reintroduce a two-column overflow on narrow devices. */

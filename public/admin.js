@@ -1,10 +1,12 @@
 const $ = selector => document.querySelector(selector);
 const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
 const money = value => `₹${Number(value || 0).toLocaleString('en-IN')}`;
+const moneyPaise = value => `₹${(Number(value || 0) / 100).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 const supabaseClient = window.supabase?.createClient && window.LINCY_SUPABASE_URL && window.LINCY_SUPABASE_PUBLISHABLE_KEY
   ? window.supabase.createClient(window.LINCY_SUPABASE_URL, window.LINCY_SUPABASE_PUBLISHABLE_KEY, { auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true } })
   : null;
-let products = [], orders = [], orderItems = [], coupons = [], activeTab = 'products', orderFeaturesReady = false;
+let products = [], orders = [], orderItems = [], paymentCaptures = [], captureRefunds = [], coupons = [], activeTab = 'products', orderFeaturesReady = false, captureLedgerReady = false;
+const ADMIN_ORDER_COLUMNS = 'id,order_number,customer_name,email,phone,address,city,state,pincode,subtotal,shipping,total,gateway_amount_paise,payment_status,payment_provider,payment_reference,status,shipping_carrier,tracking_number,tracking_url,shipped_at,delivered_at,refund_status,refund_reason,refund_requested_at,refund_resolved_at,refund_admin_note,refund_payment_reference,refund_reference,refund_amount_paise,cash_collected_at,coupon_code,discount_amount,delivery_discount,created_at,updated_at';
 const ORDER_STATUS_FLOW = {
   new: ['processing', 'packed', 'cancelled'],
   processing: ['packed', 'cancelled'],
@@ -66,7 +68,7 @@ async function refreshDashboard() {
   message('#dashboardMessage', 'Loading your store…');
   const [productResult, orderResult] = await Promise.all([
     supabaseClient.from('store_products').select('*').order('created_at', { ascending: false }),
-    supabaseClient.from('store_orders').select('*').order('created_at', { ascending: false })
+    supabaseClient.from('store_orders').select(ADMIN_ORDER_COLUMNS).order('created_at', { ascending: false })
   ]);
   if (productResult.error || orderResult.error) {
     message('#dashboardMessage', productResult.error?.message || orderResult.error?.message || 'Could not load the store.', true);
@@ -74,9 +76,25 @@ async function refreshDashboard() {
   }
   products = productResult.data || [];
   orders = orderResult.data || [];
+  if (products.length) {
+    const variantResult = await supabaseClient.from('store_product_variants').select('product_id,size,color,stock').in('product_id', products.map(product => product.id));
+    if (!variantResult.error) {
+      const grouped = new Map();
+      for (const row of variantResult.data || []) { const rows = grouped.get(row.product_id) || []; rows.push({ size: row.size || '', color: row.color || '', stock: Number(row.stock) || 0 }); grouped.set(row.product_id, rows); }
+      products = products.map(product => ({ ...product, variant_rows: grouped.get(product.id) || [] }));
+    } else {
+      products = products.map(product => ({ ...product, variant_rows: [] }));
+      if (!/store_product_variants|schema cache|relation/i.test(variantResult.error.message || '')) message('#dashboardMessage', 'Per-size/color stock could not be loaded. Refresh or apply the latest database update.', true);
+    }
+  }
+  const noteResult = orders.length
+    ? await supabaseClient.from('store_orders').select('id,customer_note').in('id', orders.map(order => order.id))
+    : { data: [], error: null };
+  const notesByOrder = new Map((noteResult.data || []).map(row => [row.id, row.customer_note || '']));
+  orders = orders.map(order => ({ ...order, customer_note: notesByOrder.get(order.id) || '' }));
   const ids = orders.map(order => order.id).filter(Boolean);
   if (ids.length) {
-    const result = await supabaseClient.from('store_order_items').select('*').in('order_id', ids);
+    const result = await supabaseClient.from('store_order_items').select('id,order_id,product_id,product_name,unit_price,quantity,selected_size,selected_color,image_url').in('order_id', ids);
     if (result.error) {
       orderItems = [];
       message('#dashboardMessage', 'Order totals loaded, but item details could not be read. Check the store_order_items admin read policy.', true);
@@ -84,7 +102,22 @@ async function refreshDashboard() {
     }
     orderItems = result.data || [];
   } else orderItems = [];
-  const schemaCheck = await supabaseClient.from('store_orders').select('user_id,customer_note,shipping_carrier,tracking_number,refund_status,cash_collected_at').limit(1);
+  paymentCaptures = []; captureRefunds = []; captureLedgerReady = !ids.length;
+  if (ids.length) {
+    const [captureResult, captureRefundResult] = await Promise.all([
+      supabaseClient.from('store_order_payments').select('id,order_id,razorpay_payment_id,amount_paise,currency,payment_status,needs_refund_review,refund_review_reason,captured_at').in('order_id', ids),
+      supabaseClient.from('store_payment_refunds').select('id,order_id,razorpay_payment_id,amount_paise,razorpay_refund_id,refund_status,admin_note,created_at').in('order_id', ids)
+    ]);
+    captureLedgerReady = !captureResult.error && !captureRefundResult.error;
+    if (captureLedgerReady) { paymentCaptures = captureResult.data || []; captureRefunds = captureRefundResult.data || []; }
+    else if (!/store_order_payments|store_payment_refunds|schema cache|relation/i.test(`${captureResult.error?.message || ''} ${captureRefundResult.error?.message || ''}`)) {
+      message('#dashboardMessage', 'Payment capture history could not be loaded. Refresh the dashboard and check the latest database update.', true);
+    }
+  }
+  // Customer notes are optional in stores upgraded from the older schema. Do
+  // not disable status, tracking, and refund controls because that display-only
+  // field has not been added yet.
+  const schemaCheck = await supabaseClient.from('store_orders').select('user_id,shipping_carrier,tracking_number,refund_status,cash_collected_at').limit(1);
   orderFeaturesReady = !schemaCheck.error;
   $('#stats').innerHTML = `<div><small>PRODUCTS</small><b>${products.length}</b></div><div><small>ORDERS</small><b>${orders.length}</b></div><div><small>TO FULFIL</small><b>${orders.filter(order => ['paid', 'cod'].includes(order.payment_status) && !['complete', 'delivered', 'cancelled'].includes(order.status) && order.refund_status !== 'processed').length}</b></div>`;
   if (orderFeaturesReady) message('#dashboardMessage', '');
@@ -170,9 +203,11 @@ function renderOrders() {
     const canRecordCodRefund = order.payment_provider === 'cod' && order.payment_status === 'cod';
     const refundAmount = (Number(order.refund_amount_paise || 0) || Math.round(Number(order.total || 0) * 100)) / 100;
     const itemMarkup = items.map(item => `<div class="admin-order-item"><img src="${escapeHtml(item.image_url || '')}" alt="" loading="lazy"><div><b>${escapeHtml(item.product_name)}</b><small>${escapeHtml(item.selected_size || 'One size')} · ${escapeHtml(item.selected_color || '—')} · Qty ${Number(item.quantity)}</small><small>Unit ${money(item.unit_price)}</small></div><strong>${money(Number(item.unit_price) * Number(item.quantity))}</strong></div>`).join('') || '<p class="admin-order-muted">No saved line items. Apply the latest checkout database update for new orders.</p>';
+    const captures = paymentCaptures.filter(payment => payment.order_id === order.id);
+    const captureMarkup = captures.length ? `<section class="admin-order-lines admin-payment-ledger"><h3>Razorpay captures (${captures.length})</h3>${captures.map(payment => { const refunds = captureRefunds.filter(refund => refund.razorpay_payment_id === payment.razorpay_payment_id), reserved = refunds.filter(refund => ['reserved','pending','processed'].includes(refund.refund_status)).reduce((sum, refund) => sum + Number(refund.amount_paise || 0), 0), remaining = Math.max(0, Number(payment.amount_paise || 0) - reserved), extra = payment.razorpay_payment_id !== order.payment_reference; return `<article class="admin-payment-capture"><div><b>${extra ? 'Additional capture' : 'Order payment'} · ${moneyPaise(payment.amount_paise)}</b><small>${escapeHtml(payment.razorpay_payment_id)} · ${formatDate(payment.captured_at)}</small>${payment.needs_refund_review ? `<small class="admin-order-muted">Refund review: ${escapeHtml(payment.refund_review_reason || 'Extra or late capture')}</small>` : ''}${refunds.map(refund => `<small>Refund ${escapeHtml(refund.razorpay_refund_id || 'being confirmed')} · ${moneyPaise(refund.amount_paise)} · ${escapeHtml(refund.refund_status)}</small>`).join('')}</div>${extra && payment.needs_refund_review && remaining >= 100 ? `<form class="admin-capture-refund-form" data-capture-refund="${escapeHtml(order.id)}" data-attempt-key="${crypto.randomUUID().replaceAll('-', '')}"><input type="hidden" name="paymentId" value="${escapeHtml(payment.razorpay_payment_id)}"><label>Refund amount (₹)<input name="refundAmount" type="number" min="1" max="${(remaining / 100).toFixed(2)}" step="0.01" value="${(remaining / 100).toFixed(2)}" required></label><div class="admin-form-feedback" aria-live="polite"></div><button class="button outline" type="submit" ${captureLedgerReady ? '' : 'disabled'}>Refund this capture</button></form>` : ''}</article>`; }).join('')}</section>` : (order.payment_provider === 'razorpay' && order.payment_reference ? `<section class="admin-order-lines"><h3>Razorpay payment history</h3><p class="admin-order-muted">No capture ledger row is available for this older order. Apply migration-fixes.sql and refresh.</p></section>` : '');
     return `<details class="admin-order-card"><summary><span><b>${escapeHtml(order.order_number)}</b><small>${escapeHtml(order.customer_name)} · ${formatDate(order.created_at)}</small></span><span>${money(order.total)}<small>${escapeHtml(order.payment_status)} · ${escapeHtml(order.payment_provider || '—')}</small></span><span class="admin-order-status">${escapeHtml(String(order.status || 'new').replaceAll('_', ' '))}</span><span class="admin-order-chevron" aria-hidden="true">⌄</span></summary><div class="admin-order-body">
-      <div class="admin-order-columns"><section><h3>Customer & delivery</h3><p><b>${escapeHtml(order.customer_name)}</b><br><a href="mailto:${escapeHtml(order.email)}">${escapeHtml(order.email)}</a><br><a href="tel:${escapeHtml(order.phone)}">${escapeHtml(order.phone)}</a></p><p>${escapeHtml(order.address)}<br>${escapeHtml(order.city)}, ${escapeHtml(order.state)} ${escapeHtml(order.pincode)}</p><small>Placed ${formatDate(order.created_at)}</small>${order.customer_note ? `<p><b>Customer order note</b><br>${escapeHtml(order.customer_note)}</p>` : '<p class="admin-order-muted">No order note provided.</p>'}</section><section><h3>Payment & amount</h3><dl class="admin-order-prices"><div><dt>Items subtotal</dt><dd>${money(order.subtotal)}</dd></div>${order.coupon_code && Number(order.discount_amount) ? `<div><dt>Coupon (${escapeHtml(order.coupon_code)})</dt><dd>−${money(order.discount_amount)}</dd></div>` : ''}<div><dt>Delivery</dt><dd>${Number(order.shipping) ? money(order.shipping) : 'Free'}</dd></div>${Number(order.delivery_discount) ? `<div><dt>Free delivery coupon (${escapeHtml(order.coupon_code)})</dt><dd>−${money(order.delivery_discount)}</dd></div>` : ''}${Number(order.gateway_amount_paise)>Math.round(Number(order.total)*100)?`<div><dt>Razorpay convenience fee</dt><dd>${money((Number(order.gateway_amount_paise)-Math.round(Number(order.total)*100))/100)}</dd></div>`:''}<div class="total"><dt>Store order total</dt><dd>${money(order.total)}</dd></div>${Number(order.gateway_amount_paise)>0?`<div><dt>Total paid to Razorpay</dt><dd>${money(Number(order.gateway_amount_paise)/100)}</dd></div>`:''}</dl><p><b>${escapeHtml(order.payment_provider || '—')}</b> · ${escapeHtml(order.payment_status)}<br>Reference: ${escapeHtml(order.payment_reference || 'Not paid yet')}${order.refund_payment_reference?`<br>Payment needing refund: ${escapeHtml(order.refund_payment_reference)}`:''}${order.refund_reference?`<br>Refund reference: ${escapeHtml(order.refund_reference)} · ${money(Number(order.refund_amount_paise||0)/100)}`:''}</p></section></div>
-      <section class="admin-order-lines"><h3>Items (${items.length})</h3>${itemMarkup}</section>
+      <div class="admin-order-columns"><section><h3>Customer & delivery</h3><p><b>${escapeHtml(order.customer_name)}</b><br><a href="mailto:${escapeHtml(order.email)}">${escapeHtml(order.email)}</a><br><a href="tel:${escapeHtml(order.phone)}">${escapeHtml(order.phone)}</a></p><p>${escapeHtml(order.address)}<br>${escapeHtml(order.city)}, ${escapeHtml(order.state)} ${escapeHtml(order.pincode)}</p><small>Placed ${formatDate(order.created_at)}</small>${order.customer_note ? `<p><b>Customer order note</b><br>${escapeHtml(order.customer_note)}</p>` : '<p class="admin-order-muted">No order note provided.</p>'}</section><section><h3>Payment & amount</h3><dl class="admin-order-prices"><div><dt>Items subtotal</dt><dd>${money(order.subtotal)}</dd></div>${order.coupon_code && Number(order.discount_amount) ? `<div><dt>Coupon (${escapeHtml(order.coupon_code)})</dt><dd>−${money(order.discount_amount)}</dd></div>` : ''}<div><dt>Delivery</dt><dd>${Number(order.shipping) ? money(order.shipping) : 'Free'}</dd></div>${Number(order.delivery_discount) ? `<div><dt>Free delivery coupon (${escapeHtml(order.coupon_code)})</dt><dd>−${money(order.delivery_discount)}</dd></div>` : ''}${Number(order.gateway_amount_paise)>Math.round(Number(order.total)*100)?`<div><dt>Razorpay convenience fee</dt><dd>${moneyPaise(Number(order.gateway_amount_paise)-Math.round(Number(order.total)*100))}</dd></div>`:''}<div class="total"><dt>Store order total</dt><dd>${money(order.total)}</dd></div>${Number(order.gateway_amount_paise)>0?`<div><dt>Total paid to Razorpay</dt><dd>${moneyPaise(Number(order.gateway_amount_paise))}</dd></div>`:''}</dl><p><b>${escapeHtml(order.payment_provider || '—')}</b> · ${escapeHtml(order.payment_status)}<br>Reference: ${escapeHtml(order.payment_reference || 'Not paid yet')}${order.refund_payment_reference?`<br>Payment needing refund: ${escapeHtml(order.refund_payment_reference)}`:''}${order.refund_reference?`<br>Refund reference: ${escapeHtml(order.refund_reference)} · ${money(Number(order.refund_amount_paise||0)/100)}`:''}</p></section></div>
+      <section class="admin-order-lines"><h3>Items (${items.length})</h3>${itemMarkup}</section>${captureMarkup}
       <div class="admin-order-columns admin-order-management"><section><h3>Fulfilment & tracking</h3><label>Order status<select data-status="${escapeHtml(order.id)}" ${orderFeaturesReady ? '' : 'disabled'}>${statusOptions.map(([value, label]) => `<option value="${value}" ${order.status === value ? 'selected' : ''}>${label}</option>`).join('')}</select></label>${order.payment_provider === 'cod' && order.payment_status === 'cod' && ['out_for_delivery','delivered','complete'].includes(currentStatus) ? `<p class="admin-cash-collected"><button class="button outline" type="button" data-cash-collected="${escapeHtml(order.id)}" ${orderFeaturesReady && !order.cash_collected_at ? '' : 'disabled'}>${order.cash_collected_at ? `Cash collected ${formatDate(order.cash_collected_at)}` : 'Mark cash collected'}</button></p>` : ''}<form class="admin-tracking-form" data-tracking="${escapeHtml(order.id)}"><label>Carrier<input name="carrier" maxlength="80" value="${escapeHtml(order.shipping_carrier || '')}" placeholder="Courier or delivery service" ${orderFeaturesReady ? '' : 'disabled'}></label><label>Tracking number<input name="trackingNumber" maxlength="120" value="${escapeHtml(order.tracking_number || '')}" placeholder="Tracking ID" ${orderFeaturesReady ? '' : 'disabled'}></label><label>Tracking link<input name="trackingUrl" type="url" value="${escapeHtml(order.tracking_url || '')}" placeholder="https://…" ${orderFeaturesReady ? '' : 'disabled'}></label><div class="admin-form-feedback" aria-live="polite"></div><button class="button outline" type="submit" ${orderFeaturesReady ? '' : 'disabled'}>Save tracking</button></form><p class="admin-order-muted">Shipped: ${formatDate(order.shipped_at)} · Delivered: ${formatDate(order.delivered_at)}</p>${trackUrl ? `<a href="${escapeHtml(trackUrl)}" target="_blank" rel="noopener noreferrer">Open tracking page ↗</a>` : ''}</section><section><h3>Refund request</h3><p><b>${escapeHtml(order.refund_status || 'none')}</b>${order.refund_reason ? `<br>Customer refund comment: ${escapeHtml(order.refund_reason)}` : ''}<br>Requested: ${formatDate(order.refund_requested_at)}</p><form class="admin-refund-form" data-refund="${escapeHtml(order.id)}"><label>Review status<select name="refundStatus" ${orderFeaturesReady ? '' : 'disabled'}>${refundOptions.map(([value, label]) => `<option value="${value}" ${(order.refund_status || 'none') === value ? 'selected' : ''}>${label}</option>`).join('')}</select></label>${canIssueRazorpayRefund || canRecordCodRefund ? `<label>Refund amount (₹)<input name="refundAmount" type="number" min="1" max="${Number(order.total || 0)}" step="0.01" value="${refundAmount}" ${orderFeaturesReady ? '' : 'disabled'}></label>` : ''}<label>Note for customer<textarea name="adminNote" rows="3" maxlength="1000" ${orderFeaturesReady ? '' : 'disabled'}>${escapeHtml(order.refund_admin_note || '')}</textarea></label><label class="admin-refund-confirm"><input type="checkbox" name="markRefunded" ${orderFeaturesReady ? '' : 'disabled'}> ${canIssueRazorpayRefund ? 'I approve submitting this refund to Razorpay now' : canRecordCodRefund ? 'I have returned this cash refund to the customer' : 'No cash payment was collected for this order'}</label><div class="admin-form-feedback" aria-live="polite"></div><button class="button outline" type="submit" ${orderFeaturesReady ? '' : 'disabled'}>Save refund review</button></form><small class="admin-order-muted">${canIssueRazorpayRefund ? 'Saving as Processed submits one idempotent refund to Razorpay. Partial amounts are supported; Razorpay confirms the final status by webhook.' : canRecordCodRefund ? 'Return the cash separately before saving this refund as Processed.' : 'Coupon-covered orders have no captured amount to refund.'}</small></section></div>
     </div></details>`;
 
@@ -218,7 +253,7 @@ function openEditor(product = {}) {
     <label>Category<select name="category">${['Churidars', 'Kurtas'].map(category => `<option ${product.category === category ? 'selected' : ''}>${category}</option>`).join('')}</select></label>
     <label>Price (₹)<input name="price" type="number" min="1" step="1" value="${product.price || ''}" required></label>
     <label>Compare-at price (₹)<input name="compare_at" type="number" min="0" step="1" value="${product.compare_at || ''}"></label>
-    <label>Stock quantity<input name="stock" type="number" min="0" step="1" value="${product.stock ?? 0}" required></label>
+    <label>Stock quantity <small>${product.variant_rows?.length ? 'Total is managed by the size/color allocations below.' : 'Shared stock until you configure size/color allocations.'}</small><input name="stock" type="number" min="0" step="1" value="${product.stock ?? 0}" required></label>
     <label>Badge<input name="badge" maxlength="40" value="${escapeHtml(product.badge || '')}"></label>
     <label class="wide">Main product image <small>Paste an HTTPS link or choose an image from this device.</small><input name="image_url" type="url" value="${escapeHtml(product.image_url || '')}" placeholder="https://…"></label>
     <label class="wide">Upload main image<input name="main_image_file" type="file" accept="image/jpeg,image/png,image/webp,image/avif"></label>
@@ -227,6 +262,8 @@ function openEditor(product = {}) {
     <label class="wide">Color-specific photos <small>Color | image URL, one per line; repeat a color for more views.</small><textarea name="color_images" rows="4" placeholder="Sage | https://…">${escapeHtml(Object.entries(product.color_images || {}).flatMap(([color, urls]) => (Array.isArray(urls) ? urls : []).map(url => `${color} | ${url}`)).join('\n'))}</textarea></label>
     <label class="wide">Sizes <small>Comma separated</small><input name="sizes" value="${escapeHtml((product.sizes || []).join(', '))}" placeholder="S, M, L, XL"></label>
     <label class="wide">Colors <small>Comma separated</small><input name="colors" value="${escapeHtml((product.colors || []).join(', '))}" placeholder="Ivory, Gold"></label>
+    <label class="wide">Stock by size and color <small>One combination per line: Size | Color | available quantity. Example: M | Blush | 4. Use “One size” or “No color” when that option does not apply. Unlisted combinations become unavailable. Leave empty to use shared stock.</small><textarea name="variant_stock" rows="6" placeholder="S | Blush | 3&#10;M | Blush | 4">${escapeHtml((product.variant_rows || []).map(row => `${row.size || 'One size'} | ${row.color || 'No color'} | ${row.stock}`).join('\n'))}</textarea></label>
+    <label class="admin-checkbox wide"><input name="clear_variant_stock" type="checkbox"> Clear these allocations and use one shared stock quantity</label>
     <label class="wide">Description<textarea name="description" maxlength="2000" required>${escapeHtml(product.description || '')}</textarea></label>
     <p class="admin-form-feedback wide" aria-live="polite"></p>
     <label class="admin-checkbox wide"><input name="active" type="checkbox" ${product.active !== false ? 'checked' : ''}> Visible in the storefront</label>
@@ -252,6 +289,18 @@ function openEditor(product = {}) {
     }
     const imageGallery = form.image_gallery.split(/\r?\n/).map(value => value.trim()).filter(Boolean);
     if (imageGallery.some(url => !/^https:\/\//i.test(url))) { formFeedback(feedback, 'Photo links must use HTTPS.', true); return; }
+    const sizes = form.sizes.split(',').map(value => value.trim()).filter(Boolean), colors = form.colors.split(',').map(value => value.trim()).filter(Boolean);
+    const variantLines = String(form.variant_stock || '').split(/\r?\n/).map(value => value.trim()).filter(Boolean), variants = [];
+    const seenVariants = new Set();
+    for (const line of variantLines) {
+      const parts = line.split('|').map(value => value.trim());
+      if (parts.length !== 3 || !/^[0-9]{1,7}$/.test(parts[2])) { formFeedback(feedback, 'Enter stock as Size | Color | whole quantity, one combination per line.', true); return; }
+      const size = /^one size$/i.test(parts[0]) ? '' : parts[0], color = /^(no color|none|—|-)$/i.test(parts[1]) ? '' : parts[1], stock = Number(parts[2]);
+      if ((sizes.length ? !sizes.includes(size) : size !== '') || (colors.length ? !colors.includes(color) : color !== '')) { formFeedback(feedback, 'Each stock line must match the product sizes and colors above.', true); return; }
+      const key = JSON.stringify([size, color]); if (seenVariants.has(key)) { formFeedback(feedback, 'Each size and color combination can appear only once.', true); return; }
+      seenVariants.add(key); variants.push({ size, color, stock });
+    }
+    if (variantLines.length && formElement.elements.clear_variant_stock.checked) { formFeedback(feedback, 'Use variant stock lines or clear allocations, not both.', true); return; }
     const imageFiles = [mainImageFile, ...galleryFiles].filter(Boolean);
     if (imageFiles.some(file => !['image/jpeg', 'image/png', 'image/webp', 'image/avif'].includes(file.type) || file.size > 10 * 1024 * 1024)) {
       formFeedback(feedback, 'Choose JPG, PNG, WebP, or AVIF images no larger than 10 MB each.', true); return;
@@ -262,13 +311,18 @@ function openEditor(product = {}) {
       if (mainImageFile) imageUrl = await uploadProductImage(mainImageFile);
       if (!imageUrl || !/^https:\/\//i.test(imageUrl)) throw new Error('Choose a main image file or enter an HTTPS image link.');
       if (galleryFiles.length) imageGallery.push(...await Promise.all(galleryFiles.map(uploadProductImage)));
-      const payload = { id: product.id || `lincy-${crypto.randomUUID()}`, name: form.name.trim(), category: form.category, price: priceValue, compare_at: compareValue, stock: Number(form.stock), badge: form.badge.trim() || null, image_url: imageUrl, image_gallery: imageGallery, color_images: colorImages, sizes: form.sizes.split(',').map(value => value.trim()).filter(Boolean), colors: form.colors.split(',').map(value => value.trim()).filter(Boolean), description: form.description.trim(), active: formElement.elements.active.checked };
+      const hasVariantInventory = Boolean(product.variant_rows?.length);
+      const payload = { id: product.id || `lincy-${crypto.randomUUID()}`, name: form.name.trim(), category: form.category, price: priceValue, compare_at: compareValue, stock: hasVariantInventory && !variants.length && !formElement.elements.clear_variant_stock.checked ? Number(product.stock) : Number(form.stock), badge: form.badge.trim() || null, image_url: imageUrl, image_gallery: imageGallery, color_images: colorImages, sizes, colors, description: form.description.trim(), active: formElement.elements.active.checked };
       let { error } = await supabaseClient.from('store_products').upsert(payload);
       if (error && /image_gallery|color_images|column/i.test(error.message || '') && !galleryFiles.length && !imageGallery.length && !Object.keys(colorImages).length) {
         const { image_gallery, color_images, ...legacyPayload } = payload;
         error = (await supabaseClient.from('store_products').upsert(legacyPayload)).error;
       }
       if (error) throw error;
+      if (variants.length || formElement.elements.clear_variant_stock.checked) {
+        const { error: variantSaveError } = await supabaseClient.rpc('save_store_product_variants', { p_product_id: payload.id, p_variants: variants });
+        if (variantSaveError) throw new Error(`Product saved, but size/color stock was not saved: ${variantSaveError.message || 'apply the latest database update and retry'}`);
+      }
       $('#adminModal').classList.add('hidden'); $('#overlay').classList.add('hidden'); await refreshDashboard();
       toast('Product saved');
     } catch (error) {
@@ -368,7 +422,7 @@ document.addEventListener('change', async event => {
 });
 
 document.addEventListener('submit', async event => {
-  const couponForm = event.target.closest('#couponForm'), trackingForm = event.target.closest('[data-tracking]'), refundForm = event.target.closest('[data-refund]');
+  const couponForm = event.target.closest('#couponForm'), trackingForm = event.target.closest('[data-tracking]'), refundForm = event.target.closest('[data-refund]'), captureRefundForm = event.target.closest('[data-capture-refund]');
   if (couponForm) {
     event.preventDefault();
     const form = new FormData(couponForm), button = couponForm.querySelector('button[type="submit"]'), originalCode = String(form.get('originalCode') || ''), code = String(form.get('code') || '').trim().toUpperCase();
@@ -389,6 +443,16 @@ document.addEventListener('submit', async event => {
     formFeedback(trackingForm, ''); button.disabled = true; button.textContent = 'Saving…';
     try { await adminOrderRequest(trackingForm.dataset.tracking, 'tracking', payload); await refreshDashboard(); toast('Tracking details saved'); }
     catch (error) { formFeedback(trackingForm, error.message, true); button.disabled = false; button.textContent = 'Save tracking'; }
+    return;
+  }
+  if (captureRefundForm) {
+    event.preventDefault();
+    const button = captureRefundForm.querySelector('button[type="submit"]'), form = new FormData(captureRefundForm);
+    if (!captureLedgerReady) { formFeedback(captureRefundForm, 'Apply the latest database update before refunding additional captures.', true); return; }
+    const amount = String(form.get('refundAmount') || ''), paymentId = String(form.get('paymentId') || '');
+    formFeedback(captureRefundForm, ''); button.disabled = true; button.textContent = 'Submitting refund…';
+    try { await adminOrderRequest(captureRefundForm.dataset.captureRefund, 'capture-refund', { paymentId, refundAmount: amount, attemptKey: captureRefundForm.dataset.attemptKey }); await refreshDashboard(); toast('Capture refund submitted to Razorpay'); }
+    catch (error) { formFeedback(captureRefundForm, error.message, true); button.disabled = false; button.textContent = 'Refund this capture'; }
     return;
   }
   if (refundForm) {

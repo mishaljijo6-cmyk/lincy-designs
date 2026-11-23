@@ -1,9 +1,12 @@
 const { authenticatedUser, body, json, method, rpc, supabase, supabaseReady } = require('../lib/server');
-const { findOrderByReceipt, paymentAmountMatchesOrder } = require('../lib/razorpay');
+const { findOrderByReceipt, listPayments, paymentAmountMatchesOrder, razorpayOrderAmountPaise } = require('../lib/razorpay');
 const { markCaptured } = require('./razorpay-webhook');
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const CUSTOMER_ORDER_COLUMNS = 'id,order_number,customer_name,email,phone,address,city,state,pincode,customer_note,subtotal,gst_amount,shipping,total,gateway_amount_paise,payment_status,payment_provider,status,shipping_carrier,tracking_number,tracking_url,shipped_at,delivered_at,refund_status,refund_reason,refund_requested_at,refund_resolved_at,refund_admin_note,created_at,updated_at,coupon_code,discount_amount,delivery_discount';
+// Keep the customer response on columns guaranteed by the deployed order
+// migration. customer_note is optional in older live schemas and must not make
+// the entire order history unavailable when that optional column is absent.
+const CUSTOMER_ORDER_COLUMNS = 'id,order_number,customer_name,email,phone,address,city,state,pincode,subtotal,gst_amount,shipping,total,gateway_amount_paise,payment_status,payment_provider,status,shipping_carrier,tracking_number,tracking_url,shipped_at,delivered_at,refund_status,refund_reason,refund_requested_at,refund_resolved_at,created_at,updated_at,coupon_code,discount_amount,delivery_discount';
 
 async function reconcilePayment(order) {
   if (!['pending', 'failed'].includes(order.payment_status) || order.payment_provider !== 'razorpay' || !process.env.RAZORPAY_KEY_ID || !process.env.RAZORPAY_KEY_SECRET) return order;
@@ -11,7 +14,7 @@ async function reconcilePayment(order) {
     let gatewayOrderId = order.razorpay_order_id;
     if (!gatewayOrderId && order.order_number) {
       const recovered = await findOrderByReceipt(order.order_number, {
-        amount: Number(order.total) * 100, currency: 'INR', storeOrderId: order.id
+        amounts: [Number(order.total) * 100, razorpayOrderAmountPaise(order.total)], currency: 'INR', storeOrderId: order.id
       });
       if (recovered) {
         const linked = await supabase(`store_orders?id=eq.${encodeURIComponent(order.id)}&payment_status=eq.${encodeURIComponent(order.payment_status)}&razorpay_order_id=is.null`, {
@@ -26,13 +29,8 @@ async function reconcilePayment(order) {
       } else return order;
     }
     if (!gatewayOrderId) return order;
-    const response = await fetch(`https://api.razorpay.com/v1/orders/${encodeURIComponent(gatewayOrderId)}/payments`, {
-      headers: { Authorization: `Basic ${Buffer.from(`${process.env.RAZORPAY_KEY_ID}:${process.env.RAZORPAY_KEY_SECRET}`).toString('base64')}` },
-      signal: AbortSignal.timeout(7000)
-    });
-    const result = await response.json().catch(() => ({}));
-    if (!response.ok || !Array.isArray(result.items)) return order;
-    const captures = result.items.filter(payment => payment.status === 'captured' && payment.order_id === gatewayOrderId && paymentAmountMatchesOrder(payment.amount, order.total) && payment.currency === 'INR');
+    const payments = await listPayments(gatewayOrderId);
+    const captures = payments.filter(payment => payment.status === 'captured' && payment.order_id === gatewayOrderId && paymentAmountMatchesOrder(payment.amount, order.total) && payment.currency === 'INR');
     if (captures.length) {
       for (const capture of captures) {
         await markCaptured(capture, gatewayOrderId);
@@ -41,7 +39,7 @@ async function reconcilePayment(order) {
       return current?.[0] || order;
     }
     const holdExpired = Date.now() - Date.parse(order.created_at || 0) >= 45 * 60 * 1000;
-    if (order.payment_status === 'pending' && holdExpired && result.items.every(payment => payment.status === 'failed')) {
+    if (order.payment_status === 'pending' && holdExpired && payments.length > 0 && payments.every(payment => payment.status === 'failed')) {
       const released = await rpc('fail_checkout_order', { p_order_id: order.id, p_razorpay_order_id: gatewayOrderId });
       if (released) return { ...order, payment_status: 'failed' };
     }
@@ -82,10 +80,23 @@ module.exports = async function orders(req, res) {
       // Listing My Orders stays light and does not call Razorpay for every old hold.
       if (requestedOrderId) orders = [await reconcilePayment(orders[0])];
       const ids = orders.map(order => order.id).filter(id => UUID.test(id));
-      const items = ids.length ? await supabase(`store_order_items?order_id=in.(${ids.join(',')})&select=id,order_id,product_id,product_name,unit_price,quantity,gst_rate,gst_amount,selected_size,selected_color,image_url&order=id.asc`) : [];
+      const [items, captureRows, captureRefundRows] = ids.length ? await Promise.all([
+        supabase(`store_order_items?order_id=in.(${ids.join(',')})&select=id,order_id,product_id,product_name,unit_price,quantity,gst_rate,gst_amount,selected_size,selected_color,image_url&order=id.asc`),
+        supabase(`store_order_payments?order_id=in.(${ids.join(',')})&select=order_id,razorpay_payment_id,amount_paise,currency,payment_status,needs_refund_review,refund_review_reason,captured_at&order=captured_at.asc`),
+        supabase(`store_payment_refunds?order_id=in.(${ids.join(',')})&select=order_id,razorpay_payment_id,amount_paise,razorpay_refund_id,refund_status,created_at&order=created_at.asc`)
+      ]) : [[], [], []];
       const itemsByOrder = new Map(orders.map(order => [order.id, []]));
       for (const item of items) itemsByOrder.get(item.order_id)?.push(item);
-      const safeOrders = orders.map(order => ({ ...order, items: itemsByOrder.get(order.id) || [] }));
+      const capturesByOrder = new Map(orders.map(order => [order.id, []]));
+      const refundsByOrder = new Map(orders.map(order => [order.id, []]));
+      for (const payment of captureRows) capturesByOrder.get(payment.order_id)?.push(payment);
+      for (const refund of captureRefundRows) refundsByOrder.get(refund.order_id)?.push(refund);
+      const safeOrders = orders.map(order => ({
+        ...order,
+        items: itemsByOrder.get(order.id) || [],
+        payment_captures: capturesByOrder.get(order.id) || [],
+        payment_refunds: refundsByOrder.get(order.id) || []
+      }));
       return json(res, 200, { orders: safeOrders, ...(requestedOrderId ? { order: safeOrders[0] } : {}) });
     } catch (error) {
       const updateRequired = error.status === 400 && /user_id|tracking_|refund_|column|schema cache/i.test(error.message || '');

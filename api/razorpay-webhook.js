@@ -19,16 +19,6 @@ function verifyWebhookSignature(secret, raw, provided) {
   return secureEqual(signature(secret, raw), provided);
 }
 
-async function paymentList(gatewayOrderId) {
-  const response = await fetch(`https://api.razorpay.com/v1/orders/${encodeURIComponent(gatewayOrderId)}/payments`, {
-    headers: { Authorization: `Basic ${Buffer.from(`${process.env.RAZORPAY_KEY_ID}:${process.env.RAZORPAY_KEY_SECRET}`).toString('base64')}` },
-    signal: AbortSignal.timeout(7000)
-  });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok || !Array.isArray(data.items)) throw new Error('Payment reconciliation failed.');
-  return data.items;
-}
-
 async function markCaptured(payment, gatewayOrderId) {
   if (!gatewayOrderId || !payment?.id || payment.status !== 'captured') return { ignored: true };
   const { enabled, maxBps } = customerConvenienceFeePolicy();
@@ -74,24 +64,60 @@ module.exports = async function razorpayWebhook(req, res) {
     const refund = event.payload?.refund?.entity;
     const gatewayOrderId = event.payload?.order?.entity?.id || payment?.order_id;
 
-    if (['payment.captured', 'order.paid'].includes(event.event)) {
-      let captured = payment?.status === 'captured' ? payment : null;
-      if (!captured && gatewayOrderId) captured = (await paymentList(gatewayOrderId)).find(item => item.status === 'captured');
-      if (captured) await markCaptured(captured, gatewayOrderId || captured.order_id);
+    if (event.event === 'payment.captured') {
+      // This signed event already contains the authoritative captured payment.
+      // Avoid a paginated provider lookup on the webhook's critical path; cron
+      // reconciliation scans the order later for additional or missed captures.
+      if (payment?.status === 'captured' && payment.order_id === gatewayOrderId) {
+        const outcome = await markCaptured(payment, gatewayOrderId);
+        if (outcome.ignored) console.error('razorpay_capture_not_applied', { gatewayOrderId, paymentId: payment.id });
+      }
+      return json(res, 200, { received: true });
+    }
+
+    if (event.event === 'order.paid') {
+      // Some Razorpay payloads include the payment entity; use it directly.
+      // If not, the scheduled reconciler finds the capture without delaying
+      // this webhook response on multiple payment-list pages.
+      if (payment?.status === 'captured' && payment.order_id === gatewayOrderId) {
+        const outcome = await markCaptured(payment, gatewayOrderId);
+        if (outcome.ignored) console.error('razorpay_capture_not_applied', { gatewayOrderId, paymentId: payment.id });
+      }
       return json(res, 200, { received: true });
     }
 
     if (event.event === 'payment.failed' && payment?.order_id) {
       // Razorpay permits another payment attempt on the same order. A failed
       // attempt is not a failed store order and must not release its stock.
-      // Still look for a capture in case events arrived out of order.
-      const payments = await paymentList(payment.order_id);
-      const captured = payments.find(item => item.status === 'captured');
-      if (captured) await markCaptured(captured, payment.order_id);
+      // Capture and failed events may be delivered out of order. A failed
+      // attempt never changes order state; payment.captured handles success
+      // directly and cron reconciliation recovers missed capture events.
       return json(res, 200, { received: true });
     }
 
     if (['refund.processed', 'refund.failed'].includes(event.event) && refund?.payment_id) {
+      const captureAttemptKey = String(refund.notes?.store_refund_attempt_key || '');
+      let captureRefundRows = await supabase(`store_payment_refunds?razorpay_refund_id=eq.${encodeURIComponent(refund.id || '')}&select=order_id,attempt_key,razorpay_payment_id,amount_paise,refund_status`);
+      if (!captureRefundRows?.length && captureAttemptKey) {
+        captureRefundRows = await supabase(`store_payment_refunds?attempt_key=eq.${encodeURIComponent(captureAttemptKey)}&select=order_id,attempt_key,razorpay_payment_id,amount_paise,refund_status`);
+      }
+      const captureRefund = captureRefundRows?.[0];
+      if (captureRefund) {
+        if (captureRefund.razorpay_payment_id !== refund.payment_id || Number(captureRefund.amount_paise) !== Number(refund.amount)) {
+          console.error('razorpay_capture_refund_mismatch', { refundId: refund.id, paymentId: refund.payment_id });
+          return json(res, 200, { received: true, stale: true });
+        }
+        await rpc('record_store_payment_refund_event', {
+          p_order_id: captureRefund.order_id,
+          p_payment_id: captureRefund.razorpay_payment_id,
+          p_attempt_key: captureRefund.attempt_key,
+          p_refund_id: refund.id,
+          p_amount_paise: Number(refund.amount),
+          p_status: event.event === 'refund.processed' ? 'processed' : 'failed',
+          p_admin_note: event.event === 'refund.processed' ? 'Razorpay confirmed this capture refund.' : 'Razorpay reported this capture refund failed.'
+        });
+        return json(res, 200, { received: true, captureRefund: true });
+      }
       let rows = await supabase(`store_orders?payment_reference=eq.${encodeURIComponent(refund.payment_id)}&select=id,total,payment_status,payment_reference,refund_reference,refund_attempt_key,refund_status`);
       let isSecondaryRefund = false;
       if (!rows?.length) {
@@ -108,13 +134,23 @@ module.exports = async function razorpayWebhook(req, res) {
           return json(res, 200, { received: true, stale: true });
         }
         const processed = event.event === 'refund.processed';
+        await rpc('record_store_payment_refund_event', {
+          p_order_id: order.id,
+          p_payment_id: refund.payment_id,
+          p_attempt_key: eventAttemptKey || order.refund_attempt_key || `legacy_${refund.id}`,
+          p_refund_id: refund.id,
+          p_amount_paise: Number(refund.amount),
+          p_status: processed ? 'processed' : 'failed',
+          p_admin_note: processed ? 'Razorpay confirmed refund processing.' : 'Razorpay reported a refund failure.'
+        });
         // Razorpay may redeliver or reorder events. A late failure event for
         // an already-processed refund must not move it back to requested.
         if (!processed && order.refund_reference === refund.id && order.refund_status === 'processed') {
           return json(res, 200, { received: true, duplicate: true });
         }
-        await supabase(`store_orders?id=eq.${encodeURIComponent(order.id)}`, {
-          method: 'PATCH', headers: { Prefer: 'return=minimal' },
+        const orderFilter = `store_orders?id=eq.${encodeURIComponent(order.id)}&refund_reference=${order.refund_reference ? `eq.${encodeURIComponent(order.refund_reference)}` : 'is.null'}&refund_attempt_key=${order.refund_attempt_key ? `eq.${encodeURIComponent(order.refund_attempt_key)}` : 'is.null'}`;
+        const updated = await supabase(orderFilter, {
+          method: 'PATCH', headers: { Prefer: 'return=representation' },
           body: JSON.stringify({
             refund_status: processed ? 'processed' : 'requested',
             refund_attempt_key: eventAttemptKey || order.refund_attempt_key || null,
@@ -125,6 +161,11 @@ module.exports = async function razorpayWebhook(req, res) {
             refund_admin_note: processed ? 'Razorpay confirmed refund processing.' : 'Razorpay reported a refund failure. Review and retry in the Razorpay dashboard.'
           })
         });
+        if (!updated?.length) {
+          // A newer refund submission won the race after the read above.
+          // Acknowledge this stale event without overwriting the newer state.
+          return json(res, 200, { received: true, stale: true });
+        }
       }
       return json(res, 200, { received: true });
     }

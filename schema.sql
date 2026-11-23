@@ -108,6 +108,42 @@ create table if not exists public.store_order_items (
 alter table public.store_order_items add column if not exists gst_rate integer not null default 0;
 alter table public.store_order_items add column if not exists gst_amount integer not null default 0;
 
+-- Optional per-size/color inventory. An empty variant table for a product means
+-- its existing aggregate stock is shared across the selected options.
+create table if not exists public.store_product_variants (
+ product_id text not null references public.store_products(id) on delete cascade,
+ size text not null default '',
+ color text not null default '',
+ stock integer not null default 0 check (stock >= 0),
+ updated_at timestamptz not null default now(),
+ primary key(product_id,size,color)
+);
+create table if not exists public.store_order_payments (
+ id uuid primary key default gen_random_uuid(),
+ order_id uuid not null references public.store_orders(id) on delete cascade,
+ razorpay_payment_id text not null unique check (razorpay_payment_id ~ '^pay_[A-Za-z0-9]+$'),
+ amount_paise bigint not null check (amount_paise > 0),
+ currency text not null check (currency = 'INR'),
+ payment_status text not null default 'captured' check (payment_status in ('captured','partially_refunded','refunded')),
+ needs_refund_review boolean not null default false,
+ refund_review_reason text,
+ captured_at timestamptz not null default now(),
+ created_at timestamptz not null default now(),
+ updated_at timestamptz not null default now()
+);
+create table if not exists public.store_payment_refunds (
+ id uuid primary key default gen_random_uuid(),
+ order_id uuid not null references public.store_orders(id) on delete cascade,
+ razorpay_payment_id text not null references public.store_order_payments(razorpay_payment_id) on delete cascade,
+ attempt_key text not null unique,
+ amount_paise bigint not null check (amount_paise >= 100),
+ razorpay_refund_id text unique,
+ refund_status text not null default 'reserved' check (refund_status in ('reserved','pending','processed','failed')),
+ admin_note text,
+ created_at timestamptz not null default now(),
+ updated_at timestamptz not null default now()
+);
+
 create table if not exists public.store_subscribers (
  email text primary key check (email = lower(email)),
  created_at timestamptz not null default now()
@@ -220,6 +256,7 @@ declare
   v_shipping integer := 0;
   v_count integer := 0;
   v_order_id uuid;
+  v_pending_id uuid;
   v_number text;
   v_line record;
   v_customer_name text := trim(coalesce(p_customer->>'name',''));
@@ -229,6 +266,9 @@ declare
 begin
   if p_provider not in ('razorpay','cod') then raise exception 'Invalid payment method'; end if;
   if p_user_id is null then raise exception 'A signed-in customer is required'; end if;
+  -- Serialize checkout creation by account so two tabs with different
+  -- idempotency keys cannot reserve two orders at the same time.
+  perform pg_advisory_xact_lock(hashtextextended(p_user_id::text, 0));
   if jsonb_typeof(p_items) <> 'array' or jsonb_array_length(p_items) < 1 or jsonb_array_length(p_items) > 20 then raise exception 'Invalid items'; end if;
   if length(v_customer_name) not between 2 and 100 or v_email !~* '^[^@ ]+@[^@ ]+\.[^@ ]+$' or v_phone !~ '^[0-9+() -]{10,20}$' then raise exception 'Invalid customer details'; end if;
   if length(v_customer_note) > 500 then raise exception 'Order note is too long'; end if;
@@ -258,6 +298,18 @@ begin
       end if;
       return jsonb_build_object('id',v_order.id,'order_number',v_order.order_number,'subtotal',v_order.subtotal,'gst_amount',v_order.gst_amount,'total',v_order.total,'shipping',v_order.shipping,'payment_status',v_order.payment_status,'payment_provider',v_order.payment_provider,'razorpay_order_id',v_order.razorpay_order_id);
     end if;
+  end if;
+
+  select id into v_pending_id
+    from public.store_orders
+   where user_id = p_user_id
+     and payment_status = 'pending'
+     and idempotency_key is distinct from p_idempotency_key
+   order by created_at asc
+   limit 1
+   for update;
+  if found then
+    raise exception 'This account already has a pending order. Finish or cancel it before starting another checkout.';
   end if;
 
   -- Lock rows in a stable order and reserve inventory in this transaction.

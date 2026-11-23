@@ -114,6 +114,88 @@ module.exports = async function adminOrders(req, res) {
       catch { return json(res, 400, { error: 'Tracking links must use HTTPS.' }); }
     }
     update = { shipping_carrier: carrier || null, tracking_number: trackingNumber || null, tracking_url: trackingUrl || null };
+  } else if (input.action === 'capture-refund') {
+    const paymentId = String(input.paymentId || '');
+    const attemptKey = String(input.attemptKey || '');
+    const amountNumber = Number(input.refundAmount);
+    const amountPaise = Math.round(amountNumber * 100);
+    if (!/^pay_[A-Za-z0-9]+$/.test(paymentId) || !/^[A-Za-z0-9_-]{16,80}$/.test(attemptKey)
+      || !Number.isFinite(amountNumber) || !Number.isSafeInteger(amountPaise) || amountPaise < 100) {
+      return json(res, 400, { error: 'Choose a captured payment and a refund amount of at least ₹1.00.' });
+    }
+    if (!process.env.RAZORPAY_KEY_ID || !process.env.RAZORPAY_KEY_SECRET) {
+      return json(res, 503, { error: 'Razorpay refunds are not configured on the server.' });
+    }
+    let order;
+    try {
+      const rows = await supabase(`store_orders?id=eq.${encodeURIComponent(orderId)}&select=id,order_number,payment_provider`);
+      order = rows?.[0];
+    } catch { return json(res, 503, { error: 'Order details could not be checked. Refresh and try again.' }); }
+    if (!order) return json(res, 404, { error: 'Order not found.' });
+    if (order.payment_provider !== 'razorpay') return json(res, 409, { error: 'This order does not have a Razorpay capture to refund.' });
+
+    let reservation;
+    try {
+      reservation = await rpc('reserve_store_capture_refund', {
+        p_order_id: orderId, p_payment_id: paymentId, p_amount_paise: amountPaise, p_attempt_key: attemptKey
+      });
+    } catch (error) {
+      const detail = String(error.message || '');
+      if (/remaining captured amount|refund amount|attached to this order/i.test(detail)) return json(res, 409, { error: detail });
+      return json(res, /function|schema cache/i.test(detail) ? 503 : 409, {
+        error: /function|schema cache/i.test(detail)
+          ? 'Capture refunds need the latest LINCY DESIGNS database update.'
+          : 'The refund could not be reserved safely. Refresh this order and retry.'
+      });
+    }
+    if (!reservation?.attempt_key || Number(reservation.amount_paise) !== amountPaise) {
+      return json(res, 409, { error: 'A refund for this capture is already being processed. Refresh the order to see its status.' });
+    }
+    if (reservation.refund_status === 'failed') {
+      return json(res, 409, { error: 'Razorpay marked the previous attempt failed. Refresh the order to start a new, safely tracked attempt.' });
+    }
+    if (reservation.refund_status === 'processed') {
+      return json(res, 200, { saved: true, refundStatus: 'processed', refundId: reservation.razorpay_refund_id, amountPaise, alreadySubmitted: true });
+    }
+
+    let refund;
+    try {
+      if (reservation.razorpay_refund_id) {
+        refund = await getRefund(reservation.razorpay_refund_id);
+      } else {
+        const payment = await getPayment(paymentId);
+        if (payment.id !== paymentId || payment.status !== 'captured' || payment.currency !== 'INR') {
+          return json(res, 409, { error: 'Razorpay does not show this payment as captured in INR, so it cannot be refunded here.' });
+        }
+        if (amountPaise > Number(payment.amount) - Number(payment.amount_refunded || 0)) {
+          return json(res, 409, { error: 'The refund exceeds the remaining captured amount shown by Razorpay.' });
+        }
+        const receipt = `LDR-${reservation.attempt_key.slice(0, 28)}`;
+        refund = await createNormalRefund(paymentId, amountPaise, reservation.attempt_key, receipt, {
+          store_order_id: orderId,
+          store_order_number: String(order.order_number || orderId).slice(0, 100),
+          store_refund_attempt_key: reservation.attempt_key
+        });
+      }
+      if (refund.payment_id !== paymentId || Number(refund.amount) !== amountPaise
+        || !/^rfnd_[A-Za-z0-9]+$/.test(String(refund.id || ''))
+        || !['pending', 'processed', 'failed'].includes(refund.status)) {
+        return json(res, 502, { error: 'Razorpay returned an unexpected refund response. Check its dashboard before retrying.' });
+      }
+      const saved = await rpc('save_store_capture_refund_result', {
+        p_attempt_key: reservation.attempt_key,
+        p_refund_id: refund.id,
+        p_status: refund.status,
+        p_admin_note: refund.status === 'processed' ? 'Razorpay confirmed this capture refund.' : refund.status === 'failed' ? 'Razorpay reported this capture refund failed.' : 'Capture refund submitted; waiting for Razorpay confirmation.'
+      });
+      if (!saved?.saved) return json(res, 503, { error: 'Razorpay accepted the refund, but its status could not be saved. Refresh and check Razorpay before retrying.' });
+      if (refund.status === 'failed') return json(res, 409, { error: 'Razorpay reports this refund attempt failed. Refresh the order to retry it safely.' });
+      return json(res, 200, { saved: true, refundId: refund.id, refundStatus: saved.status || refund.status, amountPaise });
+    } catch (error) {
+      if (error.status === 400) return json(res, 409, { error: 'Razorpay rejected this refund. Check payment eligibility in Razorpay before trying again.' });
+      if (error.status === 409) return json(res, 409, { error: 'Razorpay is already processing this refund. Refresh the order before retrying.' });
+      return json(res, 503, { error: 'Refund submission could not be confirmed. Its idempotency key is saved; check Razorpay and retry the same attempt only after refreshing.' });
+    }
   } else if (input.action === 'refund') {
     const refundStatus = String(input.refundStatus || '');
     const note = String(input.adminNote || '').trim();
@@ -138,6 +220,9 @@ module.exports = async function adminOrders(req, res) {
         const amountPaise = Math.round(amountNumber * 100);
         if (!Number.isFinite(amountNumber) || !Number.isSafeInteger(amountPaise) || amountPaise < 100) {
           return json(res, 400, { error: 'Enter a refund amount of at least ₹1.00.' });
+        }
+        if (amountPaise > Number(current.total) * 100) {
+          return json(res, 409, { error: 'The refund is capped at the store order total. The separate 2% online-payment fee is not refundable.' });
         }
         if (current.refund_amount_paise != null && Number(current.refund_amount_paise) !== amountPaise) {
           return json(res, 409, { error: 'A refund request is already saved for a different amount. Keep that amount and retry, or review the existing refund in Razorpay.' });
@@ -201,6 +286,12 @@ module.exports = async function adminOrders(req, res) {
             current.refund_reference = latest?.[0]?.refund_reference || null;
           }
           current.refund_attempt_key = attemptDigest;
+          const captureReservation = await rpc('reserve_store_capture_refund', {
+            p_order_id: orderId, p_payment_id: paymentId, p_amount_paise: amountPaise, p_attempt_key: attemptDigest
+          });
+          if (captureReservation?.attempt_key !== attemptDigest || Number(captureReservation.amount_paise) !== amountPaise) {
+            return json(res, 409, { error: 'A refund for this captured payment is already in progress. Refresh the order before retrying.' });
+          }
           const receipt = `LD-${String(current.order_number || orderId).replace(/[^A-Za-z0-9_-]/g, '').slice(-18)}-${attemptDigest.slice(0, 8)}`;
           let refund = await createNormalRefund(paymentId, amountPaise, `Lincy_${attemptDigest}`, receipt, {
             store_order_id: orderId,
@@ -270,6 +361,17 @@ module.exports = async function adminOrders(req, res) {
 };
 
 async function saveRazorpayRefund(order, paymentId, refund, adminNote, previousRefundId = null, attemptKey = null) {
+  const ledgerAttemptKey = attemptKey || createHash('sha256').update(`${order.id}:${paymentId}:${refund.id || refund.amount}`).digest('hex').slice(0, 32);
+  const ledgerResult = await rpc('record_store_payment_refund_event', {
+    p_order_id: order.id,
+    p_payment_id: paymentId,
+    p_attempt_key: ledgerAttemptKey,
+    p_refund_id: refund.id || null,
+    p_amount_paise: Number(refund.amount),
+    p_status: refund.status,
+    p_admin_note: adminNote || null
+  });
+  if (!ledgerResult?.saved) throw new Error('The refund was sent, but its payment ledger could not be updated. Check Razorpay before retrying.');
   const isPrimaryPayment = paymentId === order.payment_reference;
   const fullyRefunded = isPrimaryPayment && refund.status === 'processed'
     && Number(refund.amount) >= Number(order.total) * 100;

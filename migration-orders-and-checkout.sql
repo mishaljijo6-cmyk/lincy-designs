@@ -56,6 +56,40 @@ alter table public.store_orders
   add column if not exists cash_collected_at timestamptz,
   add column if not exists payment_reconciled_at timestamptz;
 
+create table if not exists public.store_product_variants (
+ product_id text not null references public.store_products(id) on delete cascade,
+ size text not null default '',
+ color text not null default '',
+ stock integer not null default 0 check (stock >= 0),
+ updated_at timestamptz not null default now(),
+ primary key(product_id,size,color)
+);
+create table if not exists public.store_order_payments (
+ id uuid primary key default gen_random_uuid(),
+ order_id uuid not null references public.store_orders(id) on delete cascade,
+ razorpay_payment_id text not null unique check (razorpay_payment_id ~ '^pay_[A-Za-z0-9]+$'),
+ amount_paise bigint not null check (amount_paise > 0),
+ currency text not null check (currency = 'INR'),
+ payment_status text not null default 'captured' check (payment_status in ('captured','partially_refunded','refunded')),
+ needs_refund_review boolean not null default false,
+ refund_review_reason text,
+ captured_at timestamptz not null default now(),
+ created_at timestamptz not null default now(),
+ updated_at timestamptz not null default now()
+);
+create table if not exists public.store_payment_refunds (
+ id uuid primary key default gen_random_uuid(),
+ order_id uuid not null references public.store_orders(id) on delete cascade,
+ razorpay_payment_id text not null references public.store_order_payments(razorpay_payment_id) on delete cascade,
+ attempt_key text not null unique,
+ amount_paise bigint not null check (amount_paise >= 100),
+ razorpay_refund_id text unique,
+ refund_status text not null default 'reserved' check (refund_status in ('reserved','pending','processed','failed')),
+ admin_note text,
+ created_at timestamptz not null default now(),
+ updated_at timestamptz not null default now()
+);
+
 -- Product photos can be uploaded from the admin device. Only the store owner
 -- can write files; shoppers can read the public product images.
 create or replace function public.is_lincy_admin()
@@ -351,6 +385,10 @@ begin
 end;
 $$;
 
+-- The authenticated API checks the Razorpay order and confirms that no attempt
+-- is created/authorized/captured before calling this service-role-only RPC.
+-- Razorpay has no order-cancel endpoint, so a very late bank result is still
+-- handled by record_razorpay_capture's inventory recovery/refund-review path.
 create or replace function public.release_pending_checkout_after_cancel(
   p_order_id uuid,
   p_razorpay_order_id text
@@ -371,7 +409,7 @@ begin
      or v_order.stock_released_at is not null then
     return false;
   end if;
-  update public.store_orders set payment_status = 'failed', stock_released_at = now(),
+  update public.store_orders set payment_status = 'failed', status = 'cancelled', stock_released_at = now(),
     razorpay_order_creation_token = null, razorpay_order_creating_at = null,
     updated_at = now() where id = v_order.id;
   for v_line in
@@ -427,9 +465,8 @@ begin
   v_expected_paise := v_order.total::bigint * 100;
   if p_amount_paise <> v_expected_paise and not (
     p_allow_customer_fee is true
-    and p_max_customer_fee_bps between 1 and 5000
-    and p_amount_paise > v_expected_paise
-    and p_amount_paise <= v_expected_paise + ceil(v_expected_paise::numeric * p_max_customer_fee_bps / 10000)::bigint
+    and p_max_customer_fee_bps = 200
+    and p_amount_paise = v_expected_paise + ceil(v_expected_paise::numeric * 200 / 10000)::bigint
   ) then
     return jsonb_build_object('ignored', true);
   end if;
@@ -677,8 +714,10 @@ declare
   v_order_id uuid;
   v_existing_user uuid;
   v_saved_user uuid;
+  v_pending_id uuid;
 begin
   if p_user_id is null then raise exception 'A signed-in customer is required'; end if;
+  perform pg_advisory_xact_lock(hashtextextended(p_user_id::text, 0));
 
   select user_id into v_existing_user
     from public.store_orders
@@ -686,6 +725,18 @@ begin
     for update;
   if found and (v_existing_user is null or v_existing_user <> p_user_id) then
     raise exception 'This checkout belongs to another account';
+  end if;
+
+  select id into v_pending_id
+    from public.store_orders
+   where user_id = p_user_id
+     and payment_status = 'pending'
+     and idempotency_key is distinct from p_idempotency_key
+   order by created_at asc
+   limit 1
+   for update;
+  if found then
+    raise exception 'This account already has a pending order. Finish or cancel it before starting another checkout.';
   end if;
 
   v_order := public.create_checkout_order(p_customer, p_items, p_provider, p_idempotency_key);
