@@ -18,6 +18,13 @@ const ORDER_STATUS_FLOW = {
   cancelled: []
 };
 
+function loadingMessage(target, text) {
+  const el = $(target);
+  if (!el) return;
+  const wrapper = document.createElement('span'); wrapper.className = 'loading-inline';
+  const spinner = document.createElement('span'); spinner.className = 'loading-spinner'; spinner.setAttribute('aria-hidden', 'true');
+  wrapper.append(spinner, document.createTextNode(text)); el.replaceChildren(wrapper); el.classList.remove('error');
+}
 function message(target, text, error = false) {
   const el = $(target);
   if (el) { el.textContent = text; el.classList.toggle('error', error); }
@@ -65,7 +72,7 @@ function toggleView(user) {
 }
 
 async function refreshDashboard() {
-  message('#dashboardMessage', 'Loading your store…');
+  loadingMessage('#dashboardMessage', 'Loading your store…');
   const [productResult, orderResult] = await Promise.all([
     supabaseClient.from('store_products').select('*').order('created_at', { ascending: false }),
     supabaseClient.from('store_orders').select(ADMIN_ORDER_COLUMNS).order('created_at', { ascending: false })
@@ -158,7 +165,7 @@ function dateInputValue(value) {
 }
 async function renderCoupons() {
   const root = $('#adminContent');
-  root.innerHTML = '<p class="admin-order-muted">Loading coupons…</p>';
+  root.innerHTML = '<p class="admin-order-muted loading-inline"><span class="loading-spinner" aria-hidden="true"></span><span>Loading coupons…</span></p>';
   try {
     const result = await adminCouponRequest();
     coupons = result.coupons || [];
