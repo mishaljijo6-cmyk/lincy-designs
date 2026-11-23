@@ -1,0 +1,6 @@
+.env*
+schema.sql
+migration-*.sql
+README.md
+.github/**
+tests/**

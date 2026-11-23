@@ -1,4 +1,10 @@
 {
+  "functions": {
+    "api/checkout.js": { "maxDuration": 60 },
+    "api/cron-reconcile.js": { "maxDuration": 60 },
+    "api/razorpay-webhook.js": { "maxDuration": 60 },
+    "api/verify-payment.js": { "maxDuration": 60 }
+  },
   "rewrites": [
     { "source": "/admin", "destination": "/admin.html" }
   ],

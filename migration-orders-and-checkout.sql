@@ -11,6 +11,8 @@ alter table public.store_orders
 alter table public.store_orders
   add column if not exists idempotency_key text,
   add column if not exists razorpay_order_id text,
+  add column if not exists razorpay_order_creation_token text,
+  add column if not exists razorpay_order_creating_at timestamptz,
   add column if not exists updated_at timestamptz not null default now();
 alter table public.store_order_items
   add column if not exists gst_rate integer not null default 0,
@@ -43,7 +45,10 @@ alter table public.store_orders
   add column if not exists refund_reason text,
   add column if not exists refund_requested_at timestamptz,
   add column if not exists refund_resolved_at timestamptz,
-  add column if not exists refund_admin_note text;
+  add column if not exists refund_admin_note text,
+  add column if not exists refund_reference text,
+  add column if not exists refund_payment_reference text,
+  add column if not exists refund_amount_paise bigint;
 
 -- Product photos can be uploaded from the admin device. Only the store owner
 -- can write files; shoppers can read the public product images.
@@ -115,6 +120,45 @@ using (exists (
 grant select on public.store_orders, public.store_order_items to authenticated;
 grant update on public.store_orders to authenticated;
 grant all on public.store_orders, public.store_order_items to service_role;
+
+create table if not exists public.store_api_rate_limits (
+  rate_key text primary key,
+  window_started_at timestamptz not null default now(),
+  request_count integer not null default 0 check (request_count >= 0),
+  updated_at timestamptz not null default now()
+);
+alter table public.store_api_rate_limits enable row level security;
+revoke all on public.store_api_rate_limits from public, anon, authenticated;
+grant all on public.store_api_rate_limits to service_role;
+
+create or replace function public.consume_store_rate_limit(p_key text, p_limit integer, p_window_seconds integer)
+returns boolean
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare v_count integer;
+begin
+  if p_key is null or length(p_key) not between 3 and 200
+    or p_limit not between 1 and 1000 or p_window_seconds not between 1 and 86400 then
+    raise exception 'Invalid rate limit parameters';
+  end if;
+  insert into public.store_api_rate_limits(rate_key,window_started_at,request_count,updated_at)
+  values(p_key,now(),1,now())
+  on conflict(rate_key) do update set
+    request_count=case
+      when store_api_rate_limits.window_started_at <= now()-(p_window_seconds * interval '1 second') then 1
+      else store_api_rate_limits.request_count+1
+    end,
+    window_started_at=case
+      when store_api_rate_limits.window_started_at <= now()-(p_window_seconds * interval '1 second') then now()
+      else store_api_rate_limits.window_started_at
+    end,
+    updated_at=now()
+  returning request_count into v_count;
+  return v_count <= p_limit;
+end;
+$$;
 
 -- Replace the checkout routine with a version that never expires online
 -- payment holds without first asking Razorpay whether money was captured.
@@ -197,6 +241,274 @@ begin
 end;
 $$;
 
+-- Release an order's stock reservation once, and only while no payment has
+-- been recorded. Payment webhooks can safely race this function because both
+-- paths lock the same order row.
+create or replace function public.fail_checkout_order(
+  p_order_id uuid,
+  p_razorpay_order_id text default null
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_order public.store_orders%rowtype;
+  v_line record;
+begin
+  select * into v_order
+    from public.store_orders
+   where id = p_order_id
+   for update;
+
+  if not found or v_order.payment_status <> 'pending' then return false; end if;
+  if p_razorpay_order_id is not null
+     and v_order.razorpay_order_id is distinct from p_razorpay_order_id then
+    return false;
+  end if;
+
+  update public.store_orders
+     set payment_status = 'failed', razorpay_order_creation_token = null,
+         razorpay_order_creating_at = null, updated_at = now()
+   where id = v_order.id;
+  for v_line in
+    select product_id, quantity
+      from public.store_order_items
+     where order_id = v_order.id and product_id is not null
+  loop
+    update public.store_products
+       set stock = stock + v_line.quantity
+     where id = v_line.product_id;
+  end loop;
+  return true;
+end;
+$$;
+
+-- Record a captured payment under the same order-row lock used by expiry and
+-- cancellation. This makes a late capture or second charge visible to the
+-- owner instead of silently losing it to a status-update race.
+create or replace function public.record_razorpay_capture(
+  p_gateway_order_id text,
+  p_payment_id text,
+  p_amount_paise bigint,
+  p_currency text
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_order public.store_orders%rowtype;
+  v_duplicate boolean := false;
+  v_late boolean := false;
+  v_reason text;
+  v_note text;
+begin
+  if p_gateway_order_id is null or length(p_gateway_order_id) > 100
+    or p_payment_id is null or p_payment_id !~ '^pay_[A-Za-z0-9]+$'
+    or p_currency <> 'INR' or p_amount_paise < 1 then
+    return jsonb_build_object('ignored', true);
+  end if;
+
+  select * into v_order from public.store_orders
+   where razorpay_order_id = p_gateway_order_id for update;
+  if not found or p_amount_paise <> v_order.total::bigint * 100 then
+    return jsonb_build_object('ignored', true);
+  end if;
+
+  if v_order.refund_payment_reference = p_payment_id then
+    return jsonb_build_object('duplicate', true, 'refundReview', true,
+      'latePayment', v_order.status = 'cancelled', 'duplicatePayment', v_order.status <> 'cancelled',
+      'orderId', v_order.id, 'orderNumber', v_order.order_number);
+  end if;
+  if v_order.payment_status in ('paid','refunded') and v_order.payment_reference = p_payment_id then
+    return jsonb_build_object('duplicate', true, 'refundReview', false,
+      'latePayment', false, 'duplicatePayment', false,
+      'orderId', v_order.id, 'orderNumber', v_order.order_number);
+  end if;
+
+  v_duplicate := v_order.payment_status in ('paid','refunded');
+  v_late := not v_duplicate and (v_order.payment_status <> 'pending' or v_order.status = 'cancelled');
+  if v_late or v_duplicate then
+    v_reason := case when v_duplicate
+      then 'A second payment was captured for one store order.'
+      else 'Payment was captured after the order reservation had ended.' end;
+    v_note := case when v_duplicate
+      then 'Review refund for extra captured payment ' || p_payment_id || '. The original order remains in fulfilment.'
+      else 'Review refund for late captured payment ' || p_payment_id || '. Inventory may already have been released.' end;
+  end if;
+
+  update public.store_orders set
+    payment_status = case when v_duplicate and payment_status = 'refunded' then 'refunded' else 'paid' end,
+    payment_provider = 'razorpay',
+    payment_reference = case when v_duplicate then payment_reference else p_payment_id end,
+    status = case when v_late then 'cancelled' else status end,
+    refund_status = case when v_late or v_duplicate then 'requested' else refund_status end,
+    refund_payment_reference = case when v_late or v_duplicate then p_payment_id else refund_payment_reference end,
+    refund_reason = case when v_late or v_duplicate then v_reason else refund_reason end,
+    refund_requested_at = case when v_late or v_duplicate then coalesce(refund_requested_at, now()) else refund_requested_at end,
+    refund_resolved_at = case when v_late or v_duplicate then null else refund_resolved_at end,
+    refund_admin_note = case when v_late or v_duplicate then
+      concat_ws(E'\n', nullif(refund_admin_note, ''), v_note)
+      else refund_admin_note end,
+    updated_at = now()
+  where id = v_order.id;
+
+  if not v_late and not v_duplicate
+     and to_regprocedure('public.complete_coupon_redemption(uuid)') is not null then
+    execute 'select public.complete_coupon_redemption($1)' using v_order.id;
+  end if;
+
+  return jsonb_build_object(
+    'updated', true,
+    'duplicate', false,
+    'refundReview', v_late or v_duplicate,
+    'latePayment', v_late,
+    'duplicatePayment', v_duplicate,
+    'orderId', v_order.id,
+    'orderNumber', v_order.order_number,
+    'total', v_order.total
+  );
+end;
+$$;
+
+-- A short database lease prevents two concurrent requests from creating
+-- separate Razorpay orders for the same store order.
+create or replace function public.claim_razorpay_order(p_order_id uuid, p_token text)
+returns boolean
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare v_claimed uuid;
+begin
+  if p_token is null or length(p_token) not between 20 and 100 then return false; end if;
+  update public.store_orders
+     set razorpay_order_creation_token = p_token,
+         razorpay_order_creating_at = now(),
+         updated_at = now()
+   where id = p_order_id
+     and payment_status = 'pending'
+     and razorpay_order_id is null
+     and (razorpay_order_creation_token is null
+          or razorpay_order_creating_at < now() - interval '2 minutes')
+   returning id into v_claimed;
+  return v_claimed is not null;
+end;
+$$;
+
+create or replace function public.cancel_store_order(p_order_id uuid)
+returns boolean
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare v_order public.store_orders%rowtype; v_line record;
+begin
+  select * into v_order from public.store_orders where id = p_order_id for update;
+  if not found then return false; end if;
+  if v_order.status = 'cancelled' then return true; end if;
+  if v_order.status in ('shipped','out_for_delivery','delivered','complete') then
+    raise exception 'Orders already handed to the carrier cannot be cancelled here';
+  end if;
+  if v_order.payment_status = 'pending' then raise exception 'Check the payment before cancelling this order'; end if;
+  update public.store_orders set status = 'cancelled', updated_at = now(),
+    refund_status = case when payment_status = 'paid' then 'requested' else refund_status end,
+    refund_reason = case when payment_status = 'paid' then 'Order cancelled by the store owner.' else refund_reason end,
+    refund_requested_at = case when payment_status = 'paid' then now() else refund_requested_at end,
+    refund_admin_note = case when payment_status = 'paid' then 'Payment was captured. Initiate the refund in Razorpay and save its final status.' else refund_admin_note end
+   where id = v_order.id;
+  if v_order.payment_status in ('paid','cod') then
+    for v_line in select product_id, quantity from public.store_order_items where order_id = v_order.id and product_id is not null loop
+      update public.store_products set stock = stock + v_line.quantity where id = v_line.product_id;
+    end loop;
+  end if;
+  return true;
+end;
+$$;
+
+-- Apply fulfilment transitions under the order-row lock so a payment callback
+-- cannot race an admin action and allow an unpaid order to ship.
+create or replace function public.update_store_order_status(p_order_id uuid, p_status text)
+returns boolean
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare v_order public.store_orders%rowtype; v_allowed boolean := false;
+begin
+  if p_status not in ('new','processing','packed','shipped','out_for_delivery','delivered','complete','cancelled') then
+    raise exception 'Choose a valid order status';
+  end if;
+  select * into v_order from public.store_orders where id=p_order_id for update;
+  if not found then return false; end if;
+  if p_status=v_order.status then return true; end if;
+  v_allowed := case v_order.status
+    when 'new' then p_status in ('processing','packed','cancelled')
+    when 'processing' then p_status in ('packed','cancelled')
+    when 'packed' then p_status in ('shipped','cancelled')
+    when 'shipped' then p_status in ('out_for_delivery','delivered')
+    when 'out_for_delivery' then p_status='delivered'
+    when 'delivered' then p_status='complete'
+    else false
+  end;
+  if not v_allowed then raise exception 'That order status change is not allowed'; end if;
+  if p_status='cancelled' then return public.cancel_store_order(p_order_id); end if;
+  if p_status in ('shipped','out_for_delivery','delivered','complete') and v_order.payment_status not in ('paid','cod') then
+    raise exception 'This order cannot ship until its payment is confirmed';
+  end if;
+  if p_status in ('shipped','out_for_delivery','delivered','complete') and v_order.refund_status in ('requested','approved') then
+    raise exception 'Resolve the open refund request before shipping this order';
+  end if;
+  update public.store_orders set status=p_status,
+    shipped_at=case when p_status='shipped' then coalesce(shipped_at,now()) else shipped_at end,
+    delivered_at=case when p_status in ('delivered','complete') then coalesce(delivered_at,now()) else delivered_at end,
+    updated_at=now()
+  where id=p_order_id;
+  return true;
+end;
+$$;
+
+-- Record an admin refund review only after checking the current order state.
+-- The store owner still sends the refund through Razorpay/bank first.
+create or replace function public.review_store_order_refund(
+  p_order_id uuid, p_refund_status text, p_admin_note text default null, p_confirm_refund boolean default false
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare v_order public.store_orders%rowtype;
+begin
+  if p_refund_status not in ('none','requested','approved','rejected','processed') then raise exception 'Choose a valid refund status'; end if;
+  if length(coalesce(p_admin_note,'')) > 1000 then raise exception 'Refund notes are too long'; end if;
+  select * into v_order from public.store_orders where id=p_order_id for update;
+  if not found then return false; end if;
+  if p_refund_status=v_order.refund_status then return true; end if;
+  if p_refund_status='requested' and v_order.refund_status not in ('none','rejected') then raise exception 'This refund request is already being reviewed'; end if;
+  if p_refund_status in ('approved','rejected') and v_order.refund_status<>'requested' then raise exception 'Review the customer's current refund request first'; end if;
+  if p_refund_status='processed' then
+    if not p_confirm_refund then raise exception 'Confirm that you sent the refund first'; end if;
+    if v_order.refund_status not in ('requested','approved') then raise exception 'Approve or request a refund before marking it processed'; end if;
+    if v_order.payment_status='paid' then null;
+    elsif v_order.payment_status='cod' and v_order.status in ('delivered','complete') then null;
+    else raise exception 'Only a captured prepaid order or delivered cash-on-delivery order can be marked refunded';
+    end if;
+  end if;
+  update public.store_orders set
+    refund_status=p_refund_status,
+    refund_admin_note=nullif(trim(coalesce(p_admin_note,'')),''),
+    refund_resolved_at=case when p_refund_status in ('approved','rejected','processed') then now() else null end,
+    payment_status=case when p_refund_status='processed' and payment_status='paid' then 'refunded' else payment_status end,
+    updated_at=now()
+  where id=p_order_id;
+  return true;
+end;
+$$;
+
 -- Keep the four-argument order function for existing installations, then wrap
 -- it so ownership is checked and stored before the API can return the order.
 create or replace function public.create_checkout_order(
@@ -246,17 +558,15 @@ $$;
 -- the API has reconciled its gateway payment.
 create or replace function public.expire_checkout_orders()
 returns integer language plpgsql security definer set search_path=public,pg_temp as $$
-declare v_order record; v_line record; v_count integer:=0;
+declare v_order record; v_count integer:=0;
 begin
   for v_order in select id from public.store_orders
     where payment_status='pending' and razorpay_order_id is null
       and created_at < now()-interval '45 minutes'
+      and (razorpay_order_creation_token is null
+           or razorpay_order_creating_at < now()-interval '2 minutes')
     for update skip locked loop
-    update public.store_orders set payment_status='failed' where id=v_order.id;
-    for v_line in select product_id,quantity from public.store_order_items where order_id=v_order.id and product_id is not null loop
-      update public.store_products set stock=stock+v_line.quantity where id=v_line.product_id;
-    end loop;
-    v_count:=v_count+1;
+    if public.fail_checkout_order(v_order.id,null) then v_count:=v_count+1; end if;
   end loop;
   return v_count;
 end;
@@ -268,4 +578,20 @@ revoke all on function public.create_checkout_order(jsonb,jsonb,text,text) from 
 grant execute on function public.create_checkout_order(jsonb,jsonb,text,text) to service_role;
 revoke all on function public.create_checkout_order(jsonb,jsonb,text,text,uuid) from public, anon, authenticated;
 grant execute on function public.create_checkout_order(jsonb,jsonb,text,text,uuid) to service_role;
+revoke all on function public.fail_checkout_order(uuid,text) from public, anon, authenticated;
+grant execute on function public.fail_checkout_order(uuid,text) to service_role;
+revoke all on function public.record_razorpay_capture(text,text,bigint,text) from public, anon, authenticated;
+grant execute on function public.record_razorpay_capture(text,text,bigint,text) to service_role;
+revoke all on function public.claim_razorpay_order(uuid,text) from public, anon, authenticated;
+grant execute on function public.claim_razorpay_order(uuid,text) to service_role;
+revoke all on function public.cancel_store_order(uuid) from public, anon, authenticated;
+grant execute on function public.cancel_store_order(uuid) to service_role;
+revoke all on function public.update_store_order_status(uuid,text) from public, anon, authenticated;
+grant execute on function public.update_store_order_status(uuid,text) to service_role;
+revoke all on function public.review_store_order_refund(uuid,text,text,boolean) from public, anon, authenticated;
+grant execute on function public.review_store_order_refund(uuid,text,text,boolean) to service_role;
+revoke all on function public.consume_store_rate_limit(text,integer,integer) from public, anon, authenticated;
+grant execute on function public.consume_store_rate_limit(text,integer,integer) to service_role;
+revoke all on function public.expire_checkout_orders() from public, anon, authenticated;
+grant execute on function public.expire_checkout_orders() to service_role;
 notify pgrst, 'reload schema';

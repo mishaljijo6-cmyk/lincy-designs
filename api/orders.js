@@ -1,32 +1,57 @@
-const { authenticatedUser, body, json, method, supabase, supabaseReady } = require('../lib/server');
+const { authenticatedUser, body, json, method, rpc, supabase, supabaseReady } = require('../lib/server');
+const { findOrderByReceipt } = require('../lib/razorpay');
+const { markCaptured } = require('./razorpay-webhook');
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 async function reconcilePayment(order) {
-  if (order.payment_status !== 'pending' || order.payment_provider !== 'razorpay' || !order.razorpay_order_id || !process.env.RAZORPAY_KEY_ID || !process.env.RAZORPAY_KEY_SECRET) return order;
+  if (!['pending', 'failed'].includes(order.payment_status) || order.payment_provider !== 'razorpay' || !process.env.RAZORPAY_KEY_ID || !process.env.RAZORPAY_KEY_SECRET) return order;
   try {
-    const response = await fetch(`https://api.razorpay.com/v1/orders/${encodeURIComponent(order.razorpay_order_id)}/payments`, {
-      headers: { Authorization: `Basic ${Buffer.from(`${process.env.RAZORPAY_KEY_ID}:${process.env.RAZORPAY_KEY_SECRET}`).toString('base64')}` }
+    let gatewayOrderId = order.razorpay_order_id;
+    if (!gatewayOrderId && order.order_number) {
+      const recovered = await findOrderByReceipt(order.order_number, {
+        amount: Number(order.total) * 100, currency: 'INR', storeOrderId: order.id
+      });
+      if (recovered) {
+        const linked = await supabase(`store_orders?id=eq.${encodeURIComponent(order.id)}&payment_status=eq.${encodeURIComponent(order.payment_status)}&razorpay_order_id=is.null`, {
+          method: 'PATCH', headers: { Prefer: 'return=representation' },
+          body: JSON.stringify({ razorpay_order_id: recovered.id })
+        });
+        gatewayOrderId = linked?.[0]?.razorpay_order_id || recovered.id;
+      } else if (order.payment_status === 'pending' && Date.now() - Date.parse(order.created_at || 0) >= 45 * 60 * 1000) {
+        const released = await rpc('fail_checkout_order', { p_order_id: order.id, p_razorpay_order_id: null });
+        if (released) return { ...order, payment_status: 'failed' };
+        return order;
+      } else return order;
+    }
+    if (!gatewayOrderId) return order;
+    const response = await fetch(`https://api.razorpay.com/v1/orders/${encodeURIComponent(gatewayOrderId)}/payments`, {
+      headers: { Authorization: `Basic ${Buffer.from(`${process.env.RAZORPAY_KEY_ID}:${process.env.RAZORPAY_KEY_SECRET}`).toString('base64')}` },
+      signal: AbortSignal.timeout(7000)
     });
     const result = await response.json().catch(() => ({}));
     if (!response.ok || !Array.isArray(result.items)) return order;
-    const captured = result.items.find(payment => payment.status === 'captured' && payment.order_id === order.razorpay_order_id && payment.amount === Number(order.total) * 100 && payment.currency === 'INR');
-    if (!captured) return order;
-    await supabase(`store_orders?id=eq.${encodeURIComponent(order.id)}&user_id=eq.${encodeURIComponent(order.user_id)}&payment_status=eq.pending&razorpay_order_id=eq.${encodeURIComponent(order.razorpay_order_id)}`, {
-      method: 'PATCH', headers: { Prefer: 'return=minimal' },
-      body: JSON.stringify({ payment_status: 'paid', payment_provider: 'razorpay', payment_reference: captured.id })
-    });
-    return { ...order, payment_status: 'paid', payment_reference: captured.id };
+    const captures = result.items.filter(payment => payment.status === 'captured' && payment.order_id === gatewayOrderId && payment.amount === Number(order.total) * 100 && payment.currency === 'INR');
+    if (captures.length) {
+      for (const capture of captures) {
+        await markCaptured(capture, gatewayOrderId);
+      }
+      const current = await supabase(`store_orders?id=eq.${encodeURIComponent(order.id)}&select=*`);
+      return current?.[0] || order;
+    }
+    const attemptsFailed = result.items.length > 0 && result.items.every(payment => payment.status === 'failed');
+    const holdExpired = Date.now() - Date.parse(order.created_at || 0) >= 45 * 60 * 1000;
+    if (order.payment_status === 'pending' && (attemptsFailed || (result.items.length === 0 && holdExpired))) {
+      const released = await rpc('fail_checkout_order', { p_order_id: order.id, p_razorpay_order_id: gatewayOrderId });
+      if (released) return { ...order, payment_status: 'failed' };
+    }
+    return order;
   } catch { return order; }
 }
 
 async function currentUser(req) {
   try { return await authenticatedUser(req); }
-  catch (error) {
-    throw new Error(error.code === 'SUPABASE_API_KEY'
-      ? 'The store account connection needs its Supabase server key checked in Vercel Production.'
-      : 'Account verification is temporarily unavailable. Please retry shortly.');
-  }
+  catch { throw new Error('Account verification is temporarily unavailable. Please retry shortly.'); }
 }
 
 module.exports = async function orders(req, res) {
@@ -36,22 +61,37 @@ module.exports = async function orders(req, res) {
   try { user = await currentUser(req); }
   catch (error) { return json(res, 503, { error: error.message }); }
   if (!user) return json(res, 401, { error: 'Sign in to view or manage your orders.' });
+  try {
+    const allowed = await rpc('consume_store_rate_limit', {
+      p_key: `${req.method === 'POST' ? 'refund-request' : 'order-read'}:${user.id}`,
+      p_limit: req.method === 'POST' ? 8 : 60,
+      p_window_seconds: req.method === 'POST' ? 3600 : 60
+    });
+    if (!allowed) return json(res, 429, { error: 'Too many order requests. Wait a moment, then try again.' });
+  } catch { return json(res, 503, { error: 'Order history is temporarily unavailable. Please try again shortly.' }); }
 
   if (req.method === 'GET') {
     try {
-      let orders = await supabase(`store_orders?user_id=eq.${encodeURIComponent(user.id)}&select=*&order=created_at.desc&limit=50`);
+      const requestedOrderId = String(req.query?.orderId || new URL(req.url, 'https://store.invalid').searchParams.get('orderId') || '');
+      let orders = requestedOrderId
+        ? (UUID.test(requestedOrderId) ? await supabase(`store_orders?id=eq.${encodeURIComponent(requestedOrderId)}&user_id=eq.${encodeURIComponent(user.id)}&select=*&limit=1`) : [])
+        : await supabase(`store_orders?user_id=eq.${encodeURIComponent(user.id)}&select=*&order=created_at.desc&limit=50`);
+      if (requestedOrderId && !UUID.test(requestedOrderId)) return json(res, 400, { error: 'The order ID is invalid.' });
       if (!orders.length) return json(res, 200, { orders: [] });
-      orders = await Promise.all(orders.map(reconcilePayment));
+      // Only reconcile a payment when the shopper explicitly checks one order.
+      // Listing My Orders stays light and does not call Razorpay for every old hold.
+      if (requestedOrderId) orders = [await reconcilePayment(orders[0])];
       const ids = orders.map(order => order.id).filter(id => UUID.test(id));
       const items = ids.length ? await supabase(`store_order_items?order_id=in.(${ids.join(',')})&select=id,order_id,product_id,product_name,unit_price,quantity,gst_rate,gst_amount,selected_size,selected_color,image_url&order=id.asc`) : [];
       const itemsByOrder = new Map(orders.map(order => [order.id, []]));
       for (const item of items) itemsByOrder.get(item.order_id)?.push(item);
-      return json(res, 200, { orders: orders.map(({ user_id, razorpay_order_id, ...order }) => ({ ...order, items: itemsByOrder.get(order.id) || [] })) });
+      const safeOrders = orders.map(({ user_id, razorpay_order_id, ...order }) => ({ ...order, items: itemsByOrder.get(order.id) || [] }));
+      return json(res, 200, { orders: safeOrders, ...(requestedOrderId ? { order: safeOrders[0] } : {}) });
     } catch (error) {
       const updateRequired = error.status === 400 && /user_id|tracking_|refund_|column|schema cache/i.test(error.message || '');
       return json(res, updateRequired ? 503 : 502, {
         error: updateRequired
-          ? 'Order tracking needs the latest store database update. Please contact the store owner.'
+          ? 'Order history is temporarily unavailable. Please try again shortly.'
           : 'We could not load your order history. Please try again shortly.'
       });
     }

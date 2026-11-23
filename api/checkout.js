@@ -1,41 +1,11 @@
 const { authenticatedUser, body, json, method, rpc, supabase, supabaseReady } = require('../lib/server');
 const { calculateQuote } = require('../lib/coupons');
+const { findOrderByReceipt, listPayments } = require('../lib/razorpay');
+const { markCaptured } = require('./razorpay-webhook');
 
-async function razorpayPayments(orderId) {
-  const response = await fetch(`https://api.razorpay.com/v1/orders/${encodeURIComponent(orderId)}/payments`, {
-    headers: { Authorization: `Basic ${Buffer.from(`${process.env.RAZORPAY_KEY_ID}:${process.env.RAZORPAY_KEY_SECRET}`).toString('base64')}` }
-  });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok || !Array.isArray(data.items)) throw new Error('Could not safely check the earlier payment.');
-  return data.items;
-}
-
-async function releaseAbandonedOrders() {
-  try {
-    const cutoff = new Date(Date.now() - 45 * 60 * 1000).toISOString();
-    const pending = await supabase(`store_orders?payment_status=eq.pending&created_at=lt.${encodeURIComponent(cutoff)}&select=id,total,razorpay_order_id&order=created_at.asc&limit=50`);
-    for (const order of pending) {
-      if (!order.razorpay_order_id) {
-        await rpc('fail_checkout_order', { p_order_id: order.id, p_razorpay_order_id: null });
-        continue;
-      }
-      if (!process.env.RAZORPAY_KEY_ID || !process.env.RAZORPAY_KEY_SECRET) continue;
-      const payments = await razorpayPayments(order.razorpay_order_id);
-      const captured = payments.find(payment => payment.status === 'captured' && payment.order_id === order.razorpay_order_id && payment.amount === Number(order.total) * 100 && payment.currency === 'INR');
-      if (captured) {
-        await supabase(`store_orders?id=eq.${encodeURIComponent(order.id)}&payment_status=eq.pending&razorpay_order_id=eq.${encodeURIComponent(order.razorpay_order_id)}`, {
-          method: 'PATCH', headers: { Prefer: 'return=minimal' },
-          body: JSON.stringify({ payment_status: 'paid', payment_provider: 'razorpay', payment_reference: captured.id })
-        });
-        continue;
-      }
-      // Keep authorized or otherwise unresolved attempts reserved. Release only
-      // after Razorpay confirms there is no successful payment for the order.
-      if (payments.every(payment => ['failed', 'created'].includes(payment.status))) {
-        await rpc('fail_checkout_order', { p_order_id: order.id, p_razorpay_order_id: order.razorpay_order_id });
-      }
-    }
-  } catch { /* Never block a new checkout because reconciliation is unavailable. */ }
+function validIndianPhone(value) {
+  const digits = String(value || '').replace(/\D/g, '');
+  return digits.length === 10 || (digits.length === 12 && digits.startsWith('91'));
 }
 
 module.exports = async function checkout(req, res) {
@@ -46,31 +16,33 @@ module.exports = async function checkout(req, res) {
   catch { return json(res, 400, { error: 'Please check your checkout details and try again.' }); }
   let user;
   try { user = await authenticatedUser(req); }
-  catch (error) {
-    return json(res, 503, { error: error.code === 'SUPABASE_API_KEY'
-      ? 'The store account connection needs its Supabase server key checked in Vercel Production. Your bag is saved.'
-      : 'Account verification is temporarily unavailable. Please try again.' });
+  catch {
+    return json(res, 503, { error: 'We could not confirm your account right now. Your bag is saved; please try again shortly.' });
   }
   if (!user) return json(res, 401, { error: 'Sign in to place and track your order.' });
-  await releaseAbandonedOrders();
+  try {
+    if (!await rpc('consume_store_rate_limit', { p_key: `checkout:${user.id}`, p_limit: 12, p_window_seconds: 60 })) {
+      return json(res, 429, { error: 'Too many checkout attempts. Wait a minute, then try again.' });
+    }
+  } catch {
+    return json(res, 503, { error: 'Checkout is temporarily unavailable. Your bag is saved; please try again shortly.' });
+  }
 
-  const provider = input.provider === 'cod' ? 'cod' : 'razorpay';
+  let provider = input.provider === 'cod' ? 'cod' : 'razorpay';
   const customer = input.customer || {};
   const items = Array.isArray(input.items) ? input.items : [];
   const idempotencyKey = String(input.idempotencyKey || '').slice(0, 100);
   if (!idempotencyKey || !items.length || items.length > 20) return json(res, 400, { error: 'Your cart is empty or invalid.' });
-  if (provider === 'razorpay' && (!process.env.RAZORPAY_KEY_ID || !process.env.RAZORPAY_KEY_SECRET)) {
-    return json(res, 503, { error: 'Razorpay is not configured yet. Please choose Cash on Delivery.' });
-  }
+  if (!validIndianPhone(customer.phone)) return json(res, 400, { error: 'Enter a valid Indian mobile number with 10 digits.' });
 
   // Reprice items and validate any coupon against server-side catalogue data.
   let quote;
   try {
-    quote = await calculateQuote(items, input.couponCode || '');
+    quote = await calculateQuote(items, input.couponCode || '', user.id, idempotencyKey);
   } catch (error) {
     if (error.status === 400) return json(res, 400, { error: error.message });
-    if (/store_coupons|schema cache|coupon_code|discount_amount/i.test(error.message || '')) {
-      return json(res, 503, { error: 'Coupon checkout needs the coupon database update. Your bag is saved.' });
+    if (/store_coupons|store_coupon_redemptions|schema cache|coupon_code|discount_amount|per_user_limit/i.test(error.message || '')) {
+      return json(res, 503, { error: 'Discount codes are temporarily unavailable. Your bag is saved; please try again later.' });
     }
     const status = error.status === 401 || error.status === 403 || error.status === 404 ? 503 : 502;
     return json(res, status, { error: 'Checkout is temporarily unavailable while the store connection is being fixed. Your bag is still saved.' });
@@ -79,9 +51,10 @@ module.exports = async function checkout(req, res) {
     subtotal: Number(input.expectedSubtotal),
     shipping: Number(input.expectedShipping),
     gstAmount: Number(input.expectedGstAmount),
+    deliveryDiscount: Number(input.expectedDeliveryDiscount || 0),
     total: Number(input.expectedTotal)
   };
-  const quoteChanged = ['subtotal', 'shipping', 'gstAmount', 'total'].some(key => requestedQuote[key] !== quote[key]) ||
+  const quoteChanged = ['subtotal', 'shipping', 'gstAmount', 'deliveryDiscount', 'total'].some(key => requestedQuote[key] !== quote[key]) ||
     (input.expectedDiscountAmount != null && Number(input.expectedDiscountAmount) !== quote.discountAmount) ||
     (String(input.couponCode || '').trim().toUpperCase() || null) !== quote.couponCode;
   if (quoteChanged) {
@@ -90,31 +63,42 @@ module.exports = async function checkout(req, res) {
       quote
     });
   }
+  if (quote.total === 0) provider = 'razorpay';
+  else if (input.provider === 'coupon') return json(res, 400, { error: 'This discount does not cover the full order.' });
+  if (provider === 'razorpay' && quote.total > 0 && (!process.env.RAZORPAY_KEY_ID || !process.env.RAZORPAY_KEY_SECRET)) {
+    return json(res, 503, { error: 'Online payment is temporarily unavailable. Please try again later.' });
+  }
 
   // Resolve the idempotent attempt before invoking the database RPC. The RPC
   // deliberately rejects switching providers on a pending order; close and
   // release that attempt here so the shopper can review and retry safely.
   try {
-    const priorSelect = quote.couponCode ? 'id,user_id,payment_status,payment_provider,order_number,total,razorpay_order_id,coupon_code,discount_amount' : 'id,user_id,payment_status,payment_provider,order_number,total,razorpay_order_id';
+  const priorSelect = quote.couponCode ? 'id,user_id,payment_status,payment_provider,order_number,total,razorpay_order_id,razorpay_order_creation_token,coupon_code,discount_amount,delivery_discount' : 'id,user_id,payment_status,payment_provider,order_number,total,razorpay_order_id,razorpay_order_creation_token';
     const priorRows = await supabase(`store_orders?idempotency_key=eq.${encodeURIComponent(idempotencyKey)}&select=${priorSelect}`);
     const prior = priorRows?.[0];
     if (prior && prior.user_id !== user.id) {
       return json(res, 409, { error: 'This checkout belongs to another account. Start again from your own bag.' });
     }
     if (prior?.payment_status === 'pending' && prior.payment_provider !== provider) {
+      if (prior.payment_provider === 'razorpay' && !prior.razorpay_order_id) {
+        return json(res, 409, { error: 'The earlier online payment setup is still being confirmed. Reopen online checkout and check My orders before switching methods.' });
+      }
       if (prior.payment_provider === 'razorpay' && prior.razorpay_order_id) {
         let payments;
-        try { payments = await razorpayPayments(prior.razorpay_order_id); }
+        try { payments = await listPayments(prior.razorpay_order_id); }
         catch { return json(res, 503, { error: 'We could not confirm the earlier payment yet. Please wait and check My orders before trying another method.' }); }
-        const captured = payments.find(payment => payment.status === 'captured' && payment.order_id === prior.razorpay_order_id && payment.amount === Number(prior.total) * 100 && payment.currency === 'INR');
-        if (captured) {
-          await supabase(`store_orders?id=eq.${encodeURIComponent(prior.id)}&payment_status=eq.pending&razorpay_order_id=eq.${encodeURIComponent(prior.razorpay_order_id)}`, {
-            method: 'PATCH', headers: { Prefer: 'return=minimal' },
-            body: JSON.stringify({ payment_status: 'paid', payment_provider: 'razorpay', payment_reference: captured.id })
-          });
-          return json(res, 200, { orderNumber: prior.order_number, storeOrderId: prior.id, payment: 'paid', total: prior.total, ...quote });
+        const captures = payments.filter(payment => payment.status === 'captured' && payment.order_id === prior.razorpay_order_id && payment.amount === Number(prior.total) * 100 && payment.currency === 'INR');
+        if (captures.length) {
+          let refundReview = false, refundReviewType = null;
+          for (const capture of captures) {
+            const outcome = await markCaptured(capture, prior.razorpay_order_id);
+            refundReview = outcome.refundReview || refundReview;
+            if (outcome.latePayment) refundReviewType = 'late';
+            else if (outcome.duplicatePayment) refundReviewType = 'duplicate';
+          }
+          return json(res, 200, { orderNumber: prior.order_number, storeOrderId: prior.id, payment: refundReviewType === 'late' ? 'review' : 'paid', refundReview, refundReviewType, total: prior.total, ...quote });
         }
-        if (payments.some(payment => ['created', 'authorized'].includes(payment.status))) {
+        if (!payments.length || payments.some(payment => !['failed'].includes(payment.status))) {
           return json(res, 409, { error: 'The earlier payment is still open. Finish it or wait for it to close, then check My orders before starting another payment.' });
         }
       }
@@ -130,10 +114,32 @@ module.exports = async function checkout(req, res) {
       }
       return json(res, 409, { error: 'The earlier payment attempt is still being confirmed. Please wait a moment and check My orders.' });
     }
+    if (prior?.payment_status === 'pending' && provider === 'razorpay' && prior.razorpay_order_id) {
+      let payments;
+      try { payments = await listPayments(prior.razorpay_order_id); }
+      catch { return json(res, 503, { error: 'We could not confirm the earlier payment yet. Check My orders before trying again.' }); }
+      const captures = payments.filter(payment => payment.status === 'captured' && payment.order_id === prior.razorpay_order_id && payment.amount === Number(prior.total) * 100 && payment.currency === 'INR');
+      if (captures.length) {
+        let refundReview = false, refundReviewType = null;
+        for (const capture of captures) {
+          const outcome = await markCaptured(capture, prior.razorpay_order_id);
+          refundReview = outcome.refundReview || refundReview;
+          if (outcome.latePayment) refundReviewType = 'late';
+          else if (outcome.duplicatePayment) refundReviewType = 'duplicate';
+        }
+        return json(res, 200, { orderNumber: prior.order_number, storeOrderId: prior.id, payment: refundReviewType === 'late' ? 'review' : 'paid', refundReview, refundReviewType, total: prior.total, ...quote });
+      }
+      if (payments.some(payment => ['created', 'authorized'].includes(payment.status))) {
+        return json(res, 202, { orderNumber: prior.order_number, storeOrderId: prior.id, payment: 'pending', total: prior.total });
+      }
+      if (payments.length && payments.every(payment => payment.status === 'failed')) {
+        await rpc('fail_checkout_order', { p_order_id: prior.id, p_razorpay_order_id: prior.razorpay_order_id });
+      }
+    }
   } catch (error) {
     const updateRequired = error.status === 400 && /user_id|column|schema cache/i.test(error.message || '');
     return json(res, 503, { error: updateRequired
-      ? 'Checkout needs the latest order database update before orders can be placed. Your bag is saved.'
+      ? 'Checkout is temporarily unavailable. Your bag is saved; please try again shortly.'
       : 'We could not check the earlier checkout attempt. Your bag is saved; please retry shortly.' });
   }
 
@@ -152,10 +158,10 @@ module.exports = async function checkout(req, res) {
     order = await rpc('create_checkout_order', rpcInput);
   } catch (error) {
     if (/could not find the function|schema cache|p_user_id|create_checkout_order/i.test(error.message || '') && [400, 404, 406].includes(error.status)) {
-      return json(res, 503, { error: 'Checkout needs the latest order database update before orders can be placed. Your bag is saved.' });
+      return json(res, 503, { error: 'Checkout is temporarily unavailable. Your bag is saved; please try again shortly.' });
     }
     if (/could not find the function|schema cache|p_coupon_code/i.test(error.message || '') && [400, 404, 406].includes(error.status)) {
-      return json(res, 503, { error: 'Coupon checkout needs the coupon database update. Your bag is saved.' });
+      return json(res, 503, { error: 'Discount codes are temporarily unavailable. Your bag is saved; please try again later.' });
     }
     if (/already has a pending order using another payment method/i.test(error.message || '')) {
       try {
@@ -197,7 +203,7 @@ module.exports = async function checkout(req, res) {
   const hasStoredGst = order.gst_amount !== undefined && order.gst_amount !== null && Number.isInteger(Number(order.gst_amount));
   const hasStoredDiscount = order.discount_amount !== undefined && order.discount_amount !== null && Number.isInteger(Number(order.discount_amount));
   if (order.payment_status === 'paid') {
-    return json(res, 200, { orderNumber: order.order_number, storeOrderId: order.id, payment: 'paid', total: order.total, ...quote });
+    return json(res, 200, { orderNumber: order.order_number, storeOrderId: order.id, payment: Number(order.total) === 0 && order.payment_provider === 'coupon' ? 'free' : 'paid', total: order.total, ...quote });
   }
   if (order.payment_status === 'cod') return json(res, 201, {
     orderNumber: order.order_number,
@@ -244,7 +250,8 @@ module.exports = async function checkout(req, res) {
       restartCheckout: true
     });
   }
-  if (Number(order.subtotal) !== quote.subtotal || (hasStoredGst && Number(order.gst_amount) !== quote.gstAmount) || (hasStoredDiscount && Number(order.discount_amount) !== quote.discountAmount) || (quote.couponCode && order.coupon_code !== quote.couponCode) || Number(order.shipping) !== quote.shipping || Number(order.total) !== quote.total) {
+  const hasStoredDeliveryDiscount = order.delivery_discount !== undefined && order.delivery_discount !== null && Number.isInteger(Number(order.delivery_discount));
+  if (Number(order.subtotal) !== quote.subtotal || (hasStoredGst && Number(order.gst_amount) !== quote.gstAmount) || (hasStoredDiscount && Number(order.discount_amount) !== quote.discountAmount) || (quote.couponCode && order.coupon_code !== quote.couponCode) || (hasStoredDeliveryDiscount && Number(order.delivery_discount) !== quote.deliveryDiscount) || Number(order.shipping) !== quote.shipping || Number(order.total) !== quote.total) {
     try {
       await rpc('fail_checkout_order', { p_order_id: order.id, p_razorpay_order_id: null });
     } catch {
@@ -255,6 +262,20 @@ module.exports = async function checkout(req, res) {
       quote,
       restartCheckout: true
     });
+  }
+  if (quote.total === 0) {
+    try {
+      const completed = await rpc('complete_free_checkout_order', { p_order_id: order.id, p_user_id: user.id });
+      if (!completed) {
+        const latest = await supabase(`store_orders?id=eq.${encodeURIComponent(order.id)}&select=payment_status,payment_provider`);
+        if (latest?.[0]?.payment_status !== 'paid' || latest?.[0]?.payment_provider !== 'coupon') {
+          return json(res, 409, { error: 'This order is still being confirmed. Check My orders before continuing.' });
+        }
+      }
+      return json(res, 201, { orderNumber: order.order_number, storeOrderId: order.id, payment: 'free', total: 0, ...quote });
+    } catch {
+      return json(res, 503, { error: 'The free order could not be confirmed. Your bag is saved; please check My orders.' });
+    }
   }
   if (order.razorpay_order_id) {
     return json(res, 201, {
@@ -269,27 +290,101 @@ module.exports = async function checkout(req, res) {
     });
   }
 
+  let creationToken;
+  let gatewayStateUncertain = false;
+  let paymentOrder = null;
   try {
-    const gateway = await fetch('https://api.razorpay.com/v1/orders', {
-      method: 'POST',
-      headers: {
-        Authorization: `Basic ${Buffer.from(`${process.env.RAZORPAY_KEY_ID}:${process.env.RAZORPAY_KEY_SECRET}`).toString('base64')}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        amount: order.total * 100,
-        currency: 'INR',
-        receipt: order.order_number,
-        notes: { store_order_id: order.id, store_order_number: order.order_number }
-      })
-    });
-    const paymentOrder = await gateway.json();
-    if (!gateway.ok || !paymentOrder.id || paymentOrder.amount !== order.total * 100) throw new Error('Razorpay order could not be created.');
+    creationToken = require('node:crypto').randomUUID();
+    const claimed = await rpc('claim_razorpay_order', { p_order_id: order.id, p_token: creationToken });
+    if (!claimed) {
+      const latest = await supabase(`store_orders?id=eq.${encodeURIComponent(order.id)}&select=razorpay_order_id,razorpay_order_creation_token`);
+      const existingGatewayOrderId = latest?.[0]?.razorpay_order_id;
+      if (existingGatewayOrderId) return json(res, 201, {
+        orderNumber: order.order_number, storeOrderId: order.id,
+        razorpayOrderId: existingGatewayOrderId, keyId: process.env.RAZORPAY_KEY_ID,
+        amount: order.total * 100, currency: 'INR', ...quote, total: order.total
+      });
+      return json(res, 409, { error: 'Secure payment setup is still running. Please tap Pay again in a moment.' });
+    }
+    // From this point onward, do not release stock on a generic network or DB
+    // error. A prior order lookup or a timed-out create may have succeeded.
+    gatewayStateUncertain = true;
 
-    await supabase(`store_orders?id=eq.${encodeURIComponent(order.id)}&payment_status=eq.pending`, {
-      method: 'PATCH', headers: { Prefer: 'return=minimal' },
-      body: JSON.stringify({ razorpay_order_id: paymentOrder.id })
+    // Razorpay treats receipt as its idempotency key. Recover an order whose
+    // first create response was lost before attempting another create.
+    paymentOrder = await findOrderByReceipt(order.order_number, {
+      amount: order.total * 100, currency: 'INR', storeOrderId: order.id
     });
+    if (!paymentOrder) {
+      try {
+        const gateway = await fetch('https://api.razorpay.com/v1/orders', {
+          method: 'POST',
+          headers: {
+            Authorization: `Basic ${Buffer.from(`${process.env.RAZORPAY_KEY_ID}:${process.env.RAZORPAY_KEY_SECRET}`).toString('base64')}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            amount: order.total * 100,
+            currency: 'INR',
+            receipt: order.order_number,
+            notes: { store_order_id: order.id, store_order_number: order.order_number }
+          }),
+          signal: AbortSignal.timeout(10000)
+        });
+        const created = await gateway.json().catch(() => ({}));
+        if (gateway.ok && created.id && created.amount === order.total * 100 && created.currency === 'INR') paymentOrder = created;
+      } catch { /* recover by receipt below before allowing a retry */ }
+      if (!paymentOrder) {
+        try {
+          paymentOrder = await findOrderByReceipt(order.order_number, {
+            amount: order.total * 100, currency: 'INR', storeOrderId: order.id
+          });
+        } catch { /* keep the reservation until a later safe reconciliation */ }
+      }
+      if (!paymentOrder) return json(res, 503, {
+        error: 'Payment setup is still being confirmed. Your bag and stock are held safely; check My orders before retrying.'
+      });
+    }
+
+    const linked = await supabase(`store_orders?id=eq.${encodeURIComponent(order.id)}&payment_status=eq.pending&razorpay_order_id=is.null&razorpay_order_creation_token=eq.${encodeURIComponent(creationToken)}`, {
+      method: 'PATCH', headers: { Prefer: 'return=representation' },
+      body: JSON.stringify({ razorpay_order_id: paymentOrder.id, razorpay_order_creation_token: null, razorpay_order_creating_at: null })
+    });
+    if (!linked?.length) {
+      const latest = await supabase(`store_orders?id=eq.${encodeURIComponent(order.id)}&select=razorpay_order_id`);
+      if (latest?.[0]?.razorpay_order_id === paymentOrder.id) return json(res, 201, {
+        orderNumber: order.order_number, storeOrderId: order.id,
+        razorpayOrderId: paymentOrder.id, keyId: process.env.RAZORPAY_KEY_ID,
+        amount: order.total * 100, currency: 'INR', ...quote, total: order.total
+      });
+      return json(res, 503, { error: 'Payment setup is still being confirmed. Your bag is saved; check My orders before retrying.' });
+    }
+    if (paymentOrder.status === 'paid' || Number(paymentOrder.amount_paid) > 0) {
+      const payments = await listPayments(paymentOrder.id);
+      const captures = payments.filter(payment => payment.status === 'captured'
+        && payment.order_id === paymentOrder.id
+        && payment.amount === order.total * 100
+        && payment.currency === 'INR');
+      if (!captures.length) return json(res, 202, {
+        orderNumber: order.order_number, storeOrderId: order.id, payment: 'pending', total: order.total
+      });
+      let refundReview = false, refundReviewType = null;
+      for (const capture of captures) {
+        const outcome = await markCaptured(capture, paymentOrder.id);
+        refundReview = outcome.refundReview || refundReview;
+        if (outcome.latePayment) refundReviewType = 'late';
+        else if (outcome.duplicatePayment) refundReviewType = 'duplicate';
+      }
+      return json(res, 200, {
+        orderNumber: order.order_number,
+        storeOrderId: order.id,
+        payment: refundReviewType === 'late' ? 'review' : 'paid',
+        refundReview,
+        refundReviewType,
+        total: order.total,
+        ...quote
+      });
+    }
     return json(res, 201, {
       orderNumber: order.order_number,
       storeOrderId: order.id,
@@ -301,7 +396,9 @@ module.exports = async function checkout(req, res) {
       total: order.total
     });
   } catch {
-    try { await rpc('fail_checkout_order', { p_order_id: order.id, p_razorpay_order_id: null }); } catch { /* keep the safe error response */ }
-    return json(res, 502, { error: 'Secure Razorpay checkout could not be started. Reserved stock has been released; please try again.' });
+    if (gatewayStateUncertain) {
+      return json(res, 503, { error: 'Payment setup is still being confirmed. Your bag and stock are held safely; check My orders before retrying.' });
+    }
+    return json(res, 503, { error: 'Secure payment setup could not be confirmed. Your bag is saved; check My orders before trying again.' });
   }
 };
