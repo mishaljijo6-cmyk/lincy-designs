@@ -441,4 +441,9 @@ button.request-busy::before{content:"";display:inline-block;width:13px;height:13
 .product-photo .product-badge,.product-photo .wish,.product-image-tag,.hero-caption{z-index:2}
 .recently-added-image.image-error:before{content:"LINCY DESIGNS";position:absolute;inset:0;z-index:2;display:grid;place-items:center;background:linear-gradient(145deg,#f3ecdf,#e6dbca);color:var(--green);font:500 11px var(--serif);letter-spacing:.12em}
 .product-photo.image-error img,.recently-added-image.image-error img{display:none}
-@media(max-width:650px){.network-loading{left:auto;right:max(8px,env(safe-area-inset-right,0px));top:calc(env(safe-area-inset-top,0px) + 7px)}.account-loading{min-height:90px}}
+@media(max-width:650px){
+ .network-loading{left:50%;right:auto;top:50%;transform:translate3d(-50%,-50%,0);width:max-content;max-width:calc(100vw - 32px);min-height:38px;box-sizing:border-box;justify-content:center;gap:8px;padding:9px 13px;font-size:12px;white-space:nowrap}
+ .network-loading svg{width:18px;height:18px}
+ .loading-inline{display:flex;width:100%;align-items:center;justify-content:center;text-align:center}
+ .account-loading{min-height:90px}
+}
