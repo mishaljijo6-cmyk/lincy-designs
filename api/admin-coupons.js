@@ -1,6 +1,5 @@
-const { authenticatedUser, body, json, method, rpc, supabase, supabaseReady } = require('../lib/server');
+const { authenticatedUser, body, isConfirmedStoreAdmin, json, method, rpc, supabase, supabaseReady } = require('../lib/server');
 
-const ADMIN_EMAIL = String(process.env.STORE_ADMIN_EMAIL || 'mishalmj03@gmail.com').trim().toLowerCase();
 const CODE = /^[A-Z0-9_-]{3,24}$/;
 
 function normalize(input, partial = false) {
@@ -61,7 +60,7 @@ module.exports = async function adminCoupons(req, res) {
   try { user = await authenticatedUser(req); }
   catch { return json(res, 503, { error: 'Account verification is temporarily unavailable.' }); }
   if (!user) return json(res, 401, { error: 'Sign in to manage coupons.' });
-  if (String(user.email || '').toLowerCase() !== ADMIN_EMAIL) return json(res, 403, { error: 'This account cannot manage store coupons.' });
+  if (!isConfirmedStoreAdmin(user)) return json(res, 403, { error: 'This confirmed account cannot manage store coupons.' });
   try {
     if (!await rpc('consume_store_rate_limit', { p_key: `admin-coupon-write:${user.id}`, p_limit: 60, p_window_seconds: 60 })) {
       return json(res, 429, { error: 'Too many coupon changes. Wait a moment, then try again.' });

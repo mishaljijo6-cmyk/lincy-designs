@@ -325,18 +325,52 @@ begin
 end;
 $$;
 
-create or replace function public.fail_checkout_order(p_order_id uuid, p_razorpay_order_id text default null)
-returns boolean language plpgsql security definer set search_path=public,pg_temp as $$
-declare v_order public.store_orders%rowtype; v_line record;
+create or replace function public.fail_checkout_order(
+  p_order_id uuid,
+  p_razorpay_order_id text default null
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_order public.store_orders%rowtype;
+  v_line record;
 begin
   select * into v_order from public.store_orders where id = p_order_id for update;
-  if not found or v_order.payment_status <> 'pending' then return false; end if;
-  if p_razorpay_order_id is not null and v_order.razorpay_order_id is distinct from p_razorpay_order_id then return false; end if;
-  update public.store_orders set payment_status='failed',razorpay_order_creation_token=null,razorpay_order_creating_at=null,updated_at=now() where id=v_order.id;
-  for v_line in select product_id,quantity from public.store_order_items where order_id=v_order.id and product_id is not null loop
-    update public.store_products set stock=stock+v_line.quantity where id=v_line.product_id;
+  if not found or v_order.payment_status <> 'pending' or v_order.stock_released_at is not null then
+    return false;
+  end if;
+  if p_razorpay_order_id is not null
+     and v_order.razorpay_order_id is distinct from p_razorpay_order_id then
+    return false;
+  end if;
+  -- Once an online order exists, only the reconciler may expire it after the
+  -- reservation window. Explicit customer cancellation uses its own RPC after
+  -- the API confirms Razorpay has no live/captured payment.
+  if v_order.payment_provider = 'razorpay'
+     and v_order.razorpay_order_id is not null
+     and v_order.created_at > now() - interval '45 minutes' then
+    return false;
+  end if;
+
+  update public.store_orders
+     set payment_status = 'failed', stock_released_at = now(),
+         razorpay_order_creation_token = null,
+         razorpay_order_creating_at = null,
+         updated_at = now()
+   where id = v_order.id;
+  for v_line in
+    select product_id, quantity from public.store_order_items
+     where order_id = v_order.id and product_id is not null
+  loop
+    update public.store_products set stock = stock + v_line.quantity
+     where id = v_line.product_id;
   end loop;
-  perform public.release_coupon_redemption(v_order.id);
+  if to_regprocedure('public.release_coupon_redemption(uuid)') is not null then
+    perform public.release_coupon_redemption(v_order.id);
+  end if;
   return true;
 end;
 $$;

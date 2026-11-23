@@ -1,12 +1,16 @@
 const { authenticatedUser, body, json, method, rpc, supabase, supabaseReady } = require('../lib/server');
 const { calculateQuote } = require('../lib/coupons');
-const { findOrderByReceipt, listPayments } = require('../lib/razorpay');
+const { findOrderByReceipt, listPayments, paymentAmountMatchesOrder } = require('../lib/razorpay');
 const { markCaptured } = require('./razorpay-webhook');
 
-function validIndianPhone(value) {
+function normalizeIndianPhone(value) {
   const digits = String(value || '').replace(/\D/g, '');
-  return digits.length === 10 || (digits.length === 12 && digits.startsWith('91'));
+  if (digits.length === 10) return `+91${digits}`;
+  if (digits.length === 12 && digits.startsWith('91')) return `+${digits}`;
+  return '';
 }
+
+function validIndianPhone(value) { return Boolean(normalizeIndianPhone(value)); }
 
 module.exports = async function checkout(req, res) {
   if (!method(req, res, ['POST'])) return;
@@ -29,7 +33,7 @@ module.exports = async function checkout(req, res) {
   }
 
   let provider = input.provider === 'cod' ? 'cod' : 'razorpay';
-  const customer = { ...(input.customer || {}), note: String(input.customer?.note || '').trim().slice(0, 500) };
+  const customer = { ...(input.customer || {}), phone: normalizeIndianPhone(input.customer?.phone), note: String(input.customer?.note || '').trim().slice(0, 500) };
   const items = Array.isArray(input.items) ? input.items : [];
   const idempotencyKey = String(input.idempotencyKey || '').slice(0, 100);
   if (!idempotencyKey || !items.length || items.length > 20) return json(res, 400, { error: 'Your cart is empty or invalid.' });
@@ -76,8 +80,13 @@ module.exports = async function checkout(req, res) {
   const priorSelect = quote.couponCode ? 'id,user_id,payment_status,payment_provider,order_number,total,created_at,razorpay_order_id,razorpay_order_creation_token,coupon_code,discount_amount,delivery_discount' : 'id,user_id,payment_status,payment_provider,order_number,total,created_at,razorpay_order_id,razorpay_order_creation_token';
     const priorRows = await supabase(`store_orders?idempotency_key=eq.${encodeURIComponent(idempotencyKey)}&select=${priorSelect}`);
     const prior = priorRows?.[0];
+    const requestedProvider = quote.total === 0 ? 'coupon' : provider;
     if (prior && prior.user_id !== user.id) {
       return json(res, 409, { error: 'This checkout belongs to another account. Start again from your own bag.' });
+    }
+    if (prior && ['paid', 'cod'].includes(prior.payment_status)
+      && prior.payment_provider !== requestedProvider) {
+      return json(res, 409, { error: 'This order is already confirmed with a different payment method. Open My orders to review it.' });
     }
     if (prior?.payment_status === 'failed' && prior.payment_provider !== provider) {
       return json(res, 409, { error: 'This expired reservation must be retried with its original payment method. Reopen Pay online or contact the store before choosing another method.' });
@@ -88,7 +97,7 @@ module.exports = async function checkout(req, res) {
       catch { return json(res, 503, { error: 'We could not confirm the earlier payment yet. Check My orders before trying again.' }); }
       const captures = payments.filter(payment => payment.status === 'captured'
         && payment.order_id === prior.razorpay_order_id
-        && payment.amount === Number(prior.total) * 100
+        && paymentAmountMatchesOrder(payment.amount, prior.total)
         && payment.currency === 'INR');
       if (captures.length) {
         let refundReview = false, refundReviewType = null;
@@ -112,7 +121,7 @@ module.exports = async function checkout(req, res) {
         let payments;
         try { payments = await listPayments(prior.razorpay_order_id); }
         catch { return json(res, 503, { error: 'We could not confirm the earlier payment yet. Please wait and check My orders before trying another method.' }); }
-        const captures = payments.filter(payment => payment.status === 'captured' && payment.order_id === prior.razorpay_order_id && payment.amount === Number(prior.total) * 100 && payment.currency === 'INR');
+        const captures = payments.filter(payment => payment.status === 'captured' && payment.order_id === prior.razorpay_order_id && paymentAmountMatchesOrder(payment.amount, prior.total) && payment.currency === 'INR');
         if (captures.length) {
           let refundReview = false, refundReviewType = null;
           for (const capture of captures) {
@@ -143,7 +152,7 @@ module.exports = async function checkout(req, res) {
       let payments;
       try { payments = await listPayments(prior.razorpay_order_id); }
       catch { return json(res, 503, { error: 'We could not confirm the earlier payment yet. Check My orders before trying again.' }); }
-      const captures = payments.filter(payment => payment.status === 'captured' && payment.order_id === prior.razorpay_order_id && payment.amount === Number(prior.total) * 100 && payment.currency === 'INR');
+      const captures = payments.filter(payment => payment.status === 'captured' && payment.order_id === prior.razorpay_order_id && paymentAmountMatchesOrder(payment.amount, prior.total) && payment.currency === 'INR');
       if (captures.length) {
         let refundReview = false, refundReviewType = null;
         for (const capture of captures) {
@@ -225,15 +234,23 @@ module.exports = async function checkout(req, res) {
   const hasStoredGst = order.gst_amount !== undefined && order.gst_amount !== null && Number.isInteger(Number(order.gst_amount));
   const hasStoredDiscount = order.discount_amount !== undefined && order.discount_amount !== null && Number.isInteger(Number(order.discount_amount));
   if (order.payment_status === 'paid') {
+    if (order.payment_provider !== (quote.total === 0 ? 'coupon' : provider)) {
+      return json(res, 409, { error: 'This checkout was already completed using a different payment method. Open My orders to review it.' });
+    }
     return json(res, 200, { orderNumber: order.order_number, storeOrderId: order.id, payment: Number(order.total) === 0 && order.payment_provider === 'coupon' ? 'free' : 'paid', total: order.total, ...quote });
   }
-  if (order.payment_status === 'cod') return json(res, 201, {
+  if (order.payment_status === 'cod') {
+    if (order.payment_provider !== 'cod' || provider !== 'cod') {
+      return json(res, 409, { error: 'This order is already confirmed for cash on delivery. Open My orders to review it.' });
+    }
+    return json(res, 201, {
     orderNumber: order.order_number,
     storeOrderId: order.id,
     ...quote,
     total: order.total,
     payment: 'cod'
-  });
+    });
+  }
   if (order.payment_status === 'pending' && order.payment_provider !== provider) {
     return json(res, 409, { error: 'This order is still reserved with its original payment method. Reopen that payment or check My orders before starting another method.' });
   }
@@ -357,7 +374,7 @@ module.exports = async function checkout(req, res) {
       const payments = await listPayments(paymentOrder.id);
       const captures = payments.filter(payment => payment.status === 'captured'
         && payment.order_id === paymentOrder.id
-        && payment.amount === order.total * 100
+        && paymentAmountMatchesOrder(payment.amount, order.total)
         && payment.currency === 'INR');
       if (!captures.length) return json(res, 202, {
         orderNumber: order.order_number, storeOrderId: order.id, payment: 'pending', total: order.total

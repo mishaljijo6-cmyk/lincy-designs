@@ -1,4 +1,5 @@
 const { authenticatedUser, body, json, method, rpc, secureEqual, signature, supabase } = require('../lib/server');
+const { paymentAmountMatchesOrder } = require('../lib/razorpay');
 const { markCaptured } = require('./razorpay-webhook');
 
 async function razorpayFetch(path) {
@@ -41,7 +42,7 @@ module.exports = async function verifyPayment(req, res) {
   try {
     let rows;
     try {
-      rows = await supabase(`store_orders?id=eq.${encodeURIComponent(storeOrderId)}&select=id,user_id,order_number,total,payment_status,razorpay_order_id,payment_reference,coupon_code`);
+      rows = await supabase(`store_orders?id=eq.${encodeURIComponent(storeOrderId)}&select=id,user_id,order_number,total,payment_status,razorpay_order_id,payment_reference,coupon_code,gateway_amount_paise`);
     } catch (error) {
       if (error.status === 400 && /user_id|column|schema cache/i.test(error.message || '')) {
         return json(res, 503, { error: 'Payment confirmation is temporarily unavailable. Do not pay again yet; check My orders shortly.' });
@@ -52,14 +53,14 @@ module.exports = async function verifyPayment(req, res) {
     if (!order || !order.razorpay_order_id) return json(res, 404, { error: 'We could not match this payment to your order.' });
     if (order.user_id !== user.id) return json(res, 403, { error: 'This order belongs to a different account.' });
     if (['paid', 'refunded'].includes(order.payment_status) && order.payment_reference === paymentId) {
-      return json(res, 200, { verified: true, orderNumber: order.order_number, storeOrderId: order.id, total: order.total });
+      return json(res, 200, { verified: true, orderNumber: order.order_number, storeOrderId: order.id, total: order.total, gatewayAmountPaise: order.gateway_amount_paise });
     }
 
     const expected = signature(process.env.RAZORPAY_KEY_SECRET, `${order.razorpay_order_id}|${paymentId}`);
     if (!secureEqual(expected, supplied)) return json(res, 400, { error: 'Payment could not be verified. Please contact the store before retrying.' });
 
     const payment = await razorpayFetch(`payments/${encodeURIComponent(paymentId)}`);
-    if (payment.order_id !== order.razorpay_order_id || payment.amount !== order.total * 100 || payment.currency !== 'INR') {
+    if (payment.order_id !== order.razorpay_order_id || !paymentAmountMatchesOrder(payment.amount, order.total) || payment.currency !== 'INR') {
       return json(res, 409, { error: 'Payment details did not match this order. Please contact the store.' });
     }
     if (payment.status !== 'captured') return json(res, 202, { verified: false, status: payment.status, orderNumber: order.order_number });
@@ -81,7 +82,7 @@ module.exports = async function verifyPayment(req, res) {
         return json(res, 202, { verified: false, status: 'pending', orderNumber: order.order_number, storeOrderId: order.id, total: order.total });
       }
     }
-    return json(res, 200, { verified: true, orderNumber: order.order_number, storeOrderId: order.id, total: order.total });
+    return json(res, 200, { verified: true, orderNumber: order.order_number, storeOrderId: order.id, total: order.total, gatewayAmountPaise: payment.amount });
   } catch {
     return json(res, 502, { error: 'We received your payment response but could not confirm it yet. Please try again shortly.' });
   }

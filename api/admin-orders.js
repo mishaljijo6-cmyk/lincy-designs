@@ -1,8 +1,7 @@
-const { authenticatedUser, body, json, method, rpc, supabase, supabaseReady } = require('../lib/server');
+const { authenticatedUser, body, isConfirmedStoreAdmin, json, method, rpc, supabase, supabaseReady } = require('../lib/server');
 const { createHash } = require('node:crypto');
 const { createNormalRefund, getPayment, getRefund } = require('../lib/razorpay');
 
-const ADMIN_EMAIL = String(process.env.STORE_ADMIN_EMAIL || 'mishalmj03@gmail.com').trim().toLowerCase();
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const STATUSES = new Set(['new', 'processing', 'packed', 'shipped', 'out_for_delivery', 'delivered', 'complete', 'cancelled']);
 const REFUNDS = new Set(['none', 'requested', 'approved', 'rejected', 'processed']);
@@ -14,7 +13,7 @@ module.exports = async function adminOrders(req, res) {
   try { user = await authenticatedUser(req); }
   catch { return json(res, 503, { error: 'Admin account verification is temporarily unavailable.' }); }
   if (!user) return json(res, 401, { error: 'Sign in again to manage orders.' });
-  if (String(user.email || '').toLowerCase() !== ADMIN_EMAIL) return json(res, 403, { error: 'This account cannot manage store orders.' });
+  if (!isConfirmedStoreAdmin(user)) return json(res, 403, { error: 'This confirmed account cannot manage store orders.' });
   try {
     if (!await rpc('consume_store_rate_limit', { p_key: `admin-order-write:${user.id}`, p_limit: 90, p_window_seconds: 60 })) {
       return json(res, 429, { error: 'Too many order updates. Wait a moment, then try again.' });
@@ -28,7 +27,21 @@ module.exports = async function adminOrders(req, res) {
   if (!UUID.test(orderId)) return json(res, 400, { error: 'The order ID is invalid.' });
 
   let update;
-  if (input.action === 'status') {
+  if (input.action === 'cash-collected') {
+    try {
+      const saved = await rpc('mark_store_order_cash_collected', { p_order_id: orderId });
+      return saved
+        ? json(res, 200, { saved: true, cashCollected: true })
+        : json(res, 409, { error: 'Cash can be recorded after a COD parcel is out for delivery or delivered.' });
+    } catch (error) {
+      const needsMigration = /function|schema cache/i.test(String(error.message || ''));
+      return json(res, needsMigration ? 503 : 409, {
+        error: needsMigration
+          ? 'Cash collection recording needs the latest database update.'
+          : 'Cash collection could not be recorded. Refresh the order and try again.'
+      });
+    }
+  } else if (input.action === 'status') {
     const status = String(input.status || '');
     if (!STATUSES.has(status)) return json(res, 400, { error: 'Choose a valid order status.' });
     let current;
@@ -48,7 +61,14 @@ module.exports = async function adminOrders(req, res) {
       complete: [],
       cancelled: []
     };
-    if (!transitions[current.status]?.includes(status)) return json(res, 409, { error: 'That order status change is not allowed. Refresh the order and try the next status.' });
+    if (!transitions[current.status]?.includes(status)) {
+      const nextStatuses = transitions[current.status] || [];
+      return json(res, 409, {
+        error: `Order is currently ${String(current.status || 'unknown').replaceAll('_', ' ')}. Refresh the list and choose one of its available next statuses.`,
+        currentStatus: current.status,
+        allowedStatuses: nextStatuses
+      });
+    }
     if (['shipped', 'out_for_delivery', 'delivered', 'complete'].includes(status) && !['paid', 'cod'].includes(current.payment_status)) {
       return json(res, 409, { error: 'This order cannot ship until its payment is confirmed.' });
     }
@@ -70,7 +90,18 @@ module.exports = async function adminOrders(req, res) {
       return saved ? json(res, 200, { saved: true }) : json(res, 404, { error: 'Order not found.' });
     } catch (error) {
       const message = String(error.message || '');
-      if (/not allowed|payment is confirmed|refund request/i.test(message)) return json(res, 409, { error: message });
+      if (/not allowed/i.test(message)) {
+        let latest;
+        try {
+          const rows = await supabase(`store_orders?id=eq.${encodeURIComponent(orderId)}&select=id,status`);
+          latest = rows?.[0];
+        } catch {}
+        if (latest && latest.status !== current.status) {
+          return json(res, 409, { error: `The order changed to ${String(latest.status || 'unknown').replaceAll('_', ' ')} while you were viewing it. The list has been refreshed; choose the next available status.` });
+        }
+        return json(res, 503, { error: 'The database has older order-status rules. Apply the latest migration-orders-and-checkout.sql in Supabase, then refresh and retry.' });
+      }
+      if (/payment is confirmed|refund request/i.test(message)) return json(res, 409, { error: message });
       return json(res, 503, { error: /function|schema cache/i.test(message) ? 'Order status updates are temporarily unavailable. Please refresh and try again.' : 'The order status could not be saved safely. Please refresh and try again.' });
     }
   } else if (input.action === 'tracking') {
@@ -92,7 +123,7 @@ module.exports = async function adminOrders(req, res) {
     if (refundStatus === 'processed') {
       let current;
       try {
-        const rows = await supabase(`store_orders?id=eq.${encodeURIComponent(orderId)}&select=id,order_number,status,payment_provider,payment_status,total,payment_reference,refund_payment_reference,refund_status,refund_reference,refund_amount_paise`);
+        const rows = await supabase(`store_orders?id=eq.${encodeURIComponent(orderId)}&select=id,order_number,status,payment_provider,payment_status,total,payment_reference,refund_payment_reference,refund_status,refund_reference,refund_attempt_key,refund_amount_paise`);
         current = rows?.[0];
       } catch { return json(res, 503, { error: 'Refund details could not be checked. Please refresh and try again.' }); }
       if (!current) return json(res, 404, { error: 'Order not found.' });
@@ -112,15 +143,17 @@ module.exports = async function adminOrders(req, res) {
           return json(res, 409, { error: 'A refund request is already saved for a different amount. Keep that amount and retry, or review the existing refund in Razorpay.' });
         }
 
+        let previousRefundId = current.refund_reference || null;
         try {
-          if (current.refund_reference) {
-            const existing = await getRefund(current.refund_reference);
+          if (previousRefundId) {
+            const existing = await getRefund(previousRefundId);
             if (existing.payment_id !== paymentId || Number(existing.amount) !== amountPaise) {
               return json(res, 409, { error: 'The saved Razorpay refund does not match this request. Review it in Razorpay before making another refund.' });
             }
-            if (existing.status === 'failed') return json(res, 409, { error: 'Razorpay reports that this refund failed. Review the payment in Razorpay before retrying.' });
-            const updated = await saveRazorpayRefund(current, paymentId, existing, note);
-            return json(res, 200, { saved: true, refundId: existing.id, refundStatus: existing.status, amountPaise, alreadySubmitted: true, ...updated });
+            if (existing.status !== 'failed') {
+              const updated = await saveRazorpayRefund(current, paymentId, existing, note, previousRefundId, current.refund_attempt_key || null);
+              return json(res, 200, { saved: true, refundId: existing.id, refundStatus: existing.status, amountPaise, alreadySubmitted: true, ...updated });
+            }
           }
 
           const payment = await getPayment(paymentId);
@@ -135,34 +168,59 @@ module.exports = async function adminOrders(req, res) {
           // Reserve the chosen amount before calling Razorpay. If two admin
           // requests race, only the first amount is accepted and both retries
           // use the same provider idempotency key and request body.
+          const referenceFilter = previousRefundId ? `refund_reference=eq.${encodeURIComponent(previousRefundId)}` : 'refund_reference=is.null';
           if (current.refund_amount_paise == null) {
-            const reserved = await supabase(`store_orders?id=eq.${encodeURIComponent(orderId)}&refund_status=in.(requested,approved)&refund_reference=is.null&refund_amount_paise=is.null`, {
+            const reserved = await supabase(`store_orders?id=eq.${encodeURIComponent(orderId)}&refund_status=in.(requested,approved)&${referenceFilter}&refund_amount_paise=is.null`, {
               method: 'PATCH', headers: { Prefer: 'return=representation' },
               body: JSON.stringify({ refund_amount_paise: amountPaise })
             });
             if (!reserved?.length) {
-              const latest = await supabase(`store_orders?id=eq.${encodeURIComponent(orderId)}&select=refund_amount_paise,refund_reference,refund_status`);
+              const latest = await supabase(`store_orders?id=eq.${encodeURIComponent(orderId)}&select=refund_amount_paise,refund_reference,refund_status,refund_attempt_key`);
               if (Number(latest?.[0]?.refund_amount_paise) !== amountPaise) return json(res, 409, { error: 'Another refund update is in progress. Refresh and review the saved amount before retrying.' });
               current.refund_amount_paise = amountPaise;
               current.refund_reference = latest?.[0]?.refund_reference || null;
+              current.refund_attempt_key = latest?.[0]?.refund_attempt_key || null;
             } else current.refund_amount_paise = amountPaise;
           }
-          if (current.refund_reference) return json(res, 409, { error: 'A refund was submitted while this request was running. Refresh the order and review its refund reference.' });
-
           const digest = createHash('sha256').update(`${orderId}:${paymentId}:${amountPaise}`).digest('hex').slice(0, 32);
-          const receipt = `LD-${String(current.order_number || orderId).replace(/[^A-Za-z0-9_-]/g, '').slice(-18)}-${digest.slice(0, 8)}`;
-          const refund = await createNormalRefund(paymentId, amountPaise, `Lincy_${digest}`, receipt, {
-            store_order_id: orderId,
-            store_order_number: String(current.order_number || orderId).slice(0, 100)
+          // A retry after a provider-confirmed failure gets a new idempotency
+          // key and receipt. If the response is lost, the same failed refund
+          // remains saved, so this deterministic key safely recovers the retry.
+          const attemptDigest = createHash('sha256').update(`${digest}:${previousRefundId || 'first'}`).digest('hex').slice(0, 24);
+          const previousAttemptKey = current.refund_attempt_key || null;
+          const attemptFilter = previousAttemptKey ? `refund_attempt_key=eq.${encodeURIComponent(previousAttemptKey)}` : 'refund_attempt_key=is.null';
+          const attemptReservation = await supabase(`store_orders?id=eq.${encodeURIComponent(orderId)}&refund_status=in.(requested,approved)&${referenceFilter}&${attemptFilter}`, {
+            method: 'PATCH', headers: { Prefer: 'return=representation' },
+            body: JSON.stringify({ refund_attempt_key: attemptDigest })
           });
+          if (!attemptReservation?.length) {
+            const latest = await supabase(`store_orders?id=eq.${encodeURIComponent(orderId)}&select=refund_attempt_key,refund_reference,refund_amount_paise`);
+            if (latest?.[0]?.refund_attempt_key !== attemptDigest || Number(latest?.[0]?.refund_amount_paise) !== amountPaise) {
+              return json(res, 409, { error: 'Another refund attempt is being recorded. Refresh this order before retrying.' });
+            }
+            current.refund_reference = latest?.[0]?.refund_reference || null;
+          }
+          current.refund_attempt_key = attemptDigest;
+          const receipt = `LD-${String(current.order_number || orderId).replace(/[^A-Za-z0-9_-]/g, '').slice(-18)}-${attemptDigest.slice(0, 8)}`;
+          let refund = await createNormalRefund(paymentId, amountPaise, `Lincy_${attemptDigest}`, receipt, {
+            store_order_id: orderId,
+            store_order_number: String(current.order_number || orderId).slice(0, 100),
+            refund_attempt_key: attemptDigest
+          });
+          if (refund.id && refund.status !== 'processed' && refund.status !== 'failed') {
+            // A webhook can arrive before the response is stored. Read the
+            // provider's latest state so that early webhook delivery cannot
+            // leave the admin screen stuck at "approved".
+            try { refund = await getRefund(refund.id); } catch {}
+          }
           if (refund.payment_id !== paymentId || Number(refund.amount) !== amountPaise || !/^rfnd_[A-Za-z0-9]+$/.test(String(refund.id || '')) || !['pending', 'processed', 'failed'].includes(refund.status)) {
             return json(res, 502, { error: 'Razorpay returned an unexpected refund response. Check the Razorpay dashboard before retrying.' });
           }
           if (refund.status === 'failed') {
-            await saveRazorpayRefund(current, paymentId, refund, 'Razorpay returned a failed refund. Review the refund in Razorpay before retrying.');
-            return json(res, 409, { error: 'Razorpay could not process this refund. Review the refund in Razorpay before retrying.' });
+            await saveRazorpayRefund(current, paymentId, refund, 'Razorpay reported that this refund attempt failed. You can retry the same amount from this order.', previousRefundId, attemptDigest);
+            return json(res, 409, { error: 'Razorpay reports that this refund attempt failed. The failure is recorded; retry the same amount here or review it in Razorpay.' });
           }
-          const saved = await saveRazorpayRefund(current, paymentId, refund, note);
+          const saved = await saveRazorpayRefund(current, paymentId, refund, note, previousRefundId, attemptDigest);
           return json(res, 200, { saved: true, refundId: refund.id, refundStatus: refund.status, amountPaise, ...saved });
         } catch (error) {
           if (error.status === 400) return json(res, 409, { error: 'Razorpay rejected this refund. Check the payment and refund eligibility in Razorpay before trying again.' });
@@ -211,20 +269,27 @@ module.exports = async function adminOrders(req, res) {
   }
 };
 
-async function saveRazorpayRefund(order, paymentId, refund, adminNote) {
+async function saveRazorpayRefund(order, paymentId, refund, adminNote, previousRefundId = null, attemptKey = null) {
   const isPrimaryPayment = paymentId === order.payment_reference;
   const fullyRefunded = isPrimaryPayment && refund.status === 'processed'
     && Number(refund.amount) >= Number(order.total) * 100;
   const patch = {
     refund_reference: refund.id,
+    ...(attemptKey ? { refund_attempt_key: attemptKey } : {}),
     refund_amount_paise: Number(refund.amount),
-    refund_status: refund.status === 'processed' ? 'processed' : 'approved',
+    refund_status: refund.status === 'processed' ? 'processed' : refund.status === 'failed' ? 'requested' : 'approved',
     refund_resolved_at: refund.status === 'processed' ? new Date().toISOString() : null,
     refund_admin_note: adminNote || (refund.status === 'processed' ? 'Razorpay confirmed the refund.' : 'Refund submitted to Razorpay; awaiting provider confirmation.'),
     ...(isPrimaryPayment ? {} : { refund_payment_reference: paymentId }),
     ...(fullyRefunded ? { payment_status: 'refunded' } : {})
   };
-  const rows = await supabase(`store_orders?id=eq.${encodeURIComponent(order.id)}&refund_status=in.(requested,approved)&refund_reference=is.null`, {
+  const expectedReference = previousRefundId
+    ? `refund_reference=eq.${encodeURIComponent(previousRefundId)}`
+    : 'refund_reference=is.null';
+  const expectedAttempt = attemptKey
+    ? `refund_attempt_key=eq.${encodeURIComponent(attemptKey)}`
+    : 'refund_attempt_key=is.null';
+  const rows = await supabase(`store_orders?id=eq.${encodeURIComponent(order.id)}&refund_status=in.(requested,approved)&${expectedReference}&${expectedAttempt}`, {
     method: 'PATCH', headers: { Prefer: 'return=representation' }, body: JSON.stringify(patch)
   });
   if (!rows?.length) {

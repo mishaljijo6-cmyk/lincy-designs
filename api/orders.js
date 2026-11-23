@@ -1,9 +1,9 @@
 const { authenticatedUser, body, json, method, rpc, supabase, supabaseReady } = require('../lib/server');
-const { findOrderByReceipt } = require('../lib/razorpay');
+const { findOrderByReceipt, paymentAmountMatchesOrder } = require('../lib/razorpay');
 const { markCaptured } = require('./razorpay-webhook');
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const CUSTOMER_ORDER_COLUMNS = 'id,order_number,customer_name,email,phone,address,city,state,pincode,customer_note,subtotal,gst_amount,shipping,total,payment_status,payment_provider,status,shipping_carrier,tracking_number,tracking_url,shipped_at,delivered_at,refund_status,refund_reason,refund_requested_at,refund_resolved_at,refund_admin_note,created_at,updated_at,coupon_code,discount_amount,delivery_discount';
+const CUSTOMER_ORDER_COLUMNS = 'id,order_number,customer_name,email,phone,address,city,state,pincode,customer_note,subtotal,gst_amount,shipping,total,gateway_amount_paise,payment_status,payment_provider,status,shipping_carrier,tracking_number,tracking_url,shipped_at,delivered_at,refund_status,refund_reason,refund_requested_at,refund_resolved_at,refund_admin_note,created_at,updated_at,coupon_code,discount_amount,delivery_discount';
 
 async function reconcilePayment(order) {
   if (!['pending', 'failed'].includes(order.payment_status) || order.payment_provider !== 'razorpay' || !process.env.RAZORPAY_KEY_ID || !process.env.RAZORPAY_KEY_SECRET) return order;
@@ -32,7 +32,7 @@ async function reconcilePayment(order) {
     });
     const result = await response.json().catch(() => ({}));
     if (!response.ok || !Array.isArray(result.items)) return order;
-    const captures = result.items.filter(payment => payment.status === 'captured' && payment.order_id === gatewayOrderId && payment.amount === Number(order.total) * 100 && payment.currency === 'INR');
+    const captures = result.items.filter(payment => payment.status === 'captured' && payment.order_id === gatewayOrderId && paymentAmountMatchesOrder(payment.amount, order.total) && payment.currency === 'INR');
     if (captures.length) {
       for (const capture of captures) {
         await markCaptured(capture, gatewayOrderId);

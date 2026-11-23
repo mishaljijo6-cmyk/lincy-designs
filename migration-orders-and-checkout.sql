@@ -48,11 +48,50 @@ alter table public.store_orders
   add column if not exists refund_resolved_at timestamptz,
   add column if not exists refund_admin_note text,
   add column if not exists refund_reference text,
+  add column if not exists refund_attempt_key text,
   add column if not exists refund_payment_reference text,
-  add column if not exists refund_amount_paise bigint;
+  add column if not exists refund_amount_paise bigint,
+  add column if not exists gateway_amount_paise bigint,
+  add column if not exists stock_released_at timestamptz,
+  add column if not exists cash_collected_at timestamptz,
+  add column if not exists payment_reconciled_at timestamptz;
 
 -- Product photos can be uploaded from the admin device. Only the store owner
 -- can write files; shoppers can read the public product images.
+create or replace function public.is_lincy_admin()
+returns boolean
+language sql stable security definer
+set search_path = pg_catalog, public, auth
+as $$
+  select exists (
+    select 1 from auth.users u
+     where u.id = auth.uid()
+       and u.email_confirmed_at is not null
+       and coalesce(u.raw_app_meta_data->>'store_role', '') = 'admin'
+  );
+$$;
+revoke all on function public.is_lincy_admin() from public, anon;
+grant execute on function public.is_lincy_admin() to authenticated, service_role;
+update auth.users
+   set raw_app_meta_data = coalesce(raw_app_meta_data, '{}'::jsonb) || '{"store_role":"admin"}'::jsonb
+ where lower(email) = 'mishalmj03@gmail.com'
+   and email_confirmed_at is not null
+   and raw_app_meta_data->>'store_role' is distinct from 'admin';
+
+drop policy if exists "Lincy admin manages products" on public.store_products;
+create policy "Lincy admin manages products" on public.store_products for all to authenticated
+  using (public.is_lincy_admin()) with check (public.is_lincy_admin());
+drop policy if exists "Lincy admin reads orders" on public.store_orders;
+create policy "Lincy admin reads orders" on public.store_orders for select to authenticated
+  using (public.is_lincy_admin());
+drop policy if exists "Lincy admin updates orders" on public.store_orders;
+drop policy if exists "Lincy admin reads order items" on public.store_order_items;
+create policy "Lincy admin reads order items" on public.store_order_items for select to authenticated
+  using (exists (select 1 from public.store_orders o where o.id = order_id and public.is_lincy_admin()));
+drop policy if exists "Lincy admin reads subscribers" on public.store_subscribers;
+create policy "Lincy admin reads subscribers" on public.store_subscribers for select to authenticated
+  using (public.is_lincy_admin());
+
 insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
 values ('store-product-images', 'store-product-images', true, 10485760,
         array['image/jpeg','image/png','image/webp','image/avif'])
@@ -67,19 +106,19 @@ create policy "Public reads store product images" on storage.objects
 drop policy if exists "Store owner uploads product images" on storage.objects;
 create policy "Store owner uploads product images" on storage.objects
   for insert to authenticated with check (
-    bucket_id = 'store-product-images' and lower(auth.jwt() ->> 'email') = 'mishalmj03@gmail.com'
+    bucket_id = 'store-product-images' and public.is_lincy_admin()
   );
 drop policy if exists "Store owner updates product images" on storage.objects;
 create policy "Store owner updates product images" on storage.objects
   for update to authenticated using (
-    bucket_id = 'store-product-images' and lower(auth.jwt() ->> 'email') = 'mishalmj03@gmail.com'
+    bucket_id = 'store-product-images' and public.is_lincy_admin()
   ) with check (
-    bucket_id = 'store-product-images' and lower(auth.jwt() ->> 'email') = 'mishalmj03@gmail.com'
+    bucket_id = 'store-product-images' and public.is_lincy_admin()
   );
 drop policy if exists "Store owner deletes product images" on storage.objects;
 create policy "Store owner deletes product images" on storage.objects
   for delete to authenticated using (
-    bucket_id = 'store-product-images' and lower(auth.jwt() ->> 'email') = 'mishalmj03@gmail.com'
+    bucket_id = 'store-product-images' and public.is_lincy_admin()
   );
 
 do $$ begin
@@ -110,9 +149,15 @@ create index if not exists store_orders_refund_queue_idx
   on public.store_orders(refund_status, created_at desc) where refund_status <> 'none';
 
 drop policy if exists "Customers read their own orders" on public.store_orders;
+drop policy if exists "Lincy admin reads orders" on public.store_orders;
+create policy "Lincy admin reads orders" on public.store_orders for select to authenticated
+using (public.is_lincy_admin());
 create policy "Customers read their own orders" on public.store_orders for select to authenticated
 using (user_id = auth.uid());
 drop policy if exists "Customers read their own order items" on public.store_order_items;
+drop policy if exists "Lincy admin reads order items" on public.store_order_items;
+create policy "Lincy admin reads order items" on public.store_order_items for select to authenticated
+using (exists (select 1 from public.store_orders o where o.id = order_id and public.is_lincy_admin()));
 create policy "Customers read their own order items" on public.store_order_items for select to authenticated
 using (exists (
   select 1 from public.store_orders o
@@ -227,7 +272,7 @@ begin
     select * into v_product from public.store_products where id = v_item->>'productId' and active = true for update;
     if not found then raise exception 'A selected product is unavailable'; end if;
     if v_product.stock < v_qty then raise exception 'Insufficient stock for %', v_product.name; end if;
-    if coalesce(v_item->>'size','') <> '' and not (v_item->>'size' = any(v_product.sizes)) then raise exception 'Invalid size'; end if;
+    if lower(trim(coalesce(v_item->>'size',''))) not in ('','one size') and not (trim(v_item->>'size') = any(v_product.sizes)) then raise exception 'Invalid size'; end if;
     if coalesce(v_item->>'color','') <> '' and not (v_item->>'color' = any(v_product.colors)) then raise exception 'Invalid color'; end if;
     update public.store_products set stock=stock-v_qty where id=v_product.id;
     v_subtotal := v_subtotal + v_product.price * v_qty;
@@ -246,7 +291,7 @@ begin
     v_qty := (v_item->>'quantity')::integer;
     v_tax_rate := case when v_product.price <= 2500 then 5 else 18 end;
     insert into public.store_order_items(order_id,product_id,product_name,unit_price,quantity,gst_rate,gst_amount,selected_size,selected_color,image_url)
-    values(v_order_id,v_product.id,v_product.name,v_product.price,v_qty,v_tax_rate,round((v_product.price::numeric*v_qty*v_tax_rate)/(100+v_tax_rate))::integer,nullif(v_item->>'size',''),nullif(v_item->>'color',''),v_product.image_url);
+    values(v_order_id,v_product.id,v_product.name,v_product.price,v_qty,v_tax_rate,round((v_product.price::numeric*v_qty*v_tax_rate)/(100+v_tax_rate))::integer,nullif(case when lower(trim(coalesce(v_item->>'size','')))='one size' then '' else trim(coalesce(v_item->>'size','')) end,''),nullif(v_item->>'color',''),v_product.image_url);
   end loop;
   select * into v_order from public.store_orders where id=v_order_id;
   return jsonb_build_object('id',v_order.id,'order_number',v_order.order_number,'subtotal',v_order.subtotal,'gst_amount',v_order.gst_amount,'total',v_order.total,'shipping',v_order.shipping,'payment_status',v_order.payment_status,'payment_provider',v_order.payment_provider);
@@ -269,42 +314,87 @@ declare
   v_order public.store_orders%rowtype;
   v_line record;
 begin
-  select * into v_order
-    from public.store_orders
-   where id = p_order_id
-   for update;
-
-  if not found or v_order.payment_status <> 'pending' then return false; end if;
+  select * into v_order from public.store_orders where id = p_order_id for update;
+  if not found or v_order.payment_status <> 'pending' or v_order.stock_released_at is not null then
+    return false;
+  end if;
   if p_razorpay_order_id is not null
      and v_order.razorpay_order_id is distinct from p_razorpay_order_id then
     return false;
   end if;
+  -- Once an online order exists, only the reconciler may expire it after the
+  -- reservation window. Explicit customer cancellation uses its own RPC after
+  -- the API confirms Razorpay has no live/captured payment.
+  if v_order.payment_provider = 'razorpay'
+     and v_order.razorpay_order_id is not null
+     and v_order.created_at > now() - interval '45 minutes' then
+    return false;
+  end if;
 
   update public.store_orders
-     set payment_status = 'failed', razorpay_order_creation_token = null,
-         razorpay_order_creating_at = null, updated_at = now()
+     set payment_status = 'failed', stock_released_at = now(),
+         razorpay_order_creation_token = null,
+         razorpay_order_creating_at = null,
+         updated_at = now()
    where id = v_order.id;
   for v_line in
-    select product_id, quantity
-      from public.store_order_items
+    select product_id, quantity from public.store_order_items
      where order_id = v_order.id and product_id is not null
   loop
-    update public.store_products
-       set stock = stock + v_line.quantity
+    update public.store_products set stock = stock + v_line.quantity
      where id = v_line.product_id;
   end loop;
+  if to_regprocedure('public.release_coupon_redemption(uuid)') is not null then
+    perform public.release_coupon_redemption(v_order.id);
+  end if;
   return true;
 end;
 $$;
 
--- Record a captured payment under the same order-row lock used by expiry and
--- cancellation. This makes a late capture or second charge visible to the
--- owner instead of silently losing it to a status-update race.
+create or replace function public.release_pending_checkout_after_cancel(
+  p_order_id uuid,
+  p_razorpay_order_id text
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_order public.store_orders%rowtype;
+  v_line record;
+begin
+  select * into v_order from public.store_orders where id = p_order_id for update;
+  if not found or v_order.payment_status <> 'pending'
+     or v_order.payment_provider <> 'razorpay'
+     or v_order.razorpay_order_id is distinct from p_razorpay_order_id
+     or v_order.stock_released_at is not null then
+    return false;
+  end if;
+  update public.store_orders set payment_status = 'failed', stock_released_at = now(),
+    razorpay_order_creation_token = null, razorpay_order_creating_at = null,
+    updated_at = now() where id = v_order.id;
+  for v_line in
+    select product_id, quantity from public.store_order_items
+     where order_id = v_order.id and product_id is not null
+  loop
+    update public.store_products set stock = stock + v_line.quantity
+     where id = v_line.product_id;
+  end loop;
+  if to_regprocedure('public.release_coupon_redemption(uuid)') is not null then
+    perform public.release_coupon_redemption(v_order.id);
+  end if;
+  return true;
+end;
+$$;
+
 create or replace function public.record_razorpay_capture(
   p_gateway_order_id text,
   p_payment_id text,
   p_amount_paise bigint,
-  p_currency text
+  p_currency text,
+  p_allow_customer_fee boolean,
+  p_max_customer_fee_bps integer
 )
 returns jsonb
 language plpgsql
@@ -313,10 +403,15 @@ set search_path = public, pg_temp
 as $$
 declare
   v_order public.store_orders%rowtype;
+  v_line record;
+  v_product public.store_products%rowtype;
   v_duplicate boolean := false;
   v_late boolean := false;
+  v_recover boolean := false;
+  v_can_recover boolean := true;
   v_reason text;
   v_note text;
+  v_expected_paise bigint;
 begin
   if p_gateway_order_id is null or length(p_gateway_order_id) > 100
     or p_payment_id is null or p_payment_id !~ '^pay_[A-Za-z0-9]+$'
@@ -326,10 +421,18 @@ begin
 
   select * into v_order from public.store_orders
    where razorpay_order_id = p_gateway_order_id for update;
-  if not found or p_amount_paise <> v_order.total::bigint * 100 then
+  if not found then
     return jsonb_build_object('ignored', true);
   end if;
-
+  v_expected_paise := v_order.total::bigint * 100;
+  if p_amount_paise <> v_expected_paise and not (
+    p_allow_customer_fee is true
+    and p_max_customer_fee_bps between 1 and 5000
+    and p_amount_paise > v_expected_paise
+    and p_amount_paise <= v_expected_paise + ceil(v_expected_paise::numeric * p_max_customer_fee_bps / 10000)::bigint
+  ) then
+    return jsonb_build_object('ignored', true);
+  end if;
   if v_order.refund_payment_reference = p_payment_id then
     return jsonb_build_object('duplicate', true, 'refundReview', true,
       'latePayment', v_order.status = 'cancelled', 'duplicatePayment', v_order.status <> 'cancelled',
@@ -342,19 +445,51 @@ begin
   end if;
 
   v_duplicate := v_order.payment_status in ('paid','refunded');
-  v_late := not v_duplicate and (v_order.payment_status <> 'pending' or v_order.status = 'cancelled');
-  if v_late or v_duplicate then
+  v_recover := v_order.payment_status = 'failed' and v_order.status <> 'cancelled';
+  if v_recover and v_order.stock_released_at is not null then
+    -- Stable ordering prevents two late captures from deadlocking while they
+    -- try to reclaim stock from the same set of products.
+    for v_line in
+      select product_id, sum(quantity)::integer as quantity
+        from public.store_order_items
+       where order_id = v_order.id and product_id is not null
+       group by product_id order by product_id
+    loop
+      select * into v_product from public.store_products where id = v_line.product_id for update;
+      if not found or v_product.active is distinct from true or v_product.stock < v_line.quantity then
+        v_can_recover := false;
+      end if;
+    end loop;
+    if v_can_recover then
+      for v_line in
+        select product_id, sum(quantity)::integer as quantity
+          from public.store_order_items
+         where order_id = v_order.id and product_id is not null
+         group by product_id order by product_id
+      loop
+        update public.store_products set stock = stock - v_line.quantity
+         where id = v_line.product_id;
+      end loop;
+      update public.store_orders set stock_released_at = null where id = v_order.id;
+    end if;
+  end if;
+
+  v_late := (v_order.status = 'cancelled')
+    or (v_recover and not v_can_recover)
+    or (v_order.payment_status not in ('pending','failed','paid','refunded'));
+  if v_duplicate or v_late then
     v_reason := case when v_duplicate
       then 'A second payment was captured for one store order.'
-      else 'Payment was captured after the order reservation had ended.' end;
+      else 'Payment was captured after the order reservation ended and inventory could not be restored.' end;
     v_note := case when v_duplicate
       then 'Review refund for extra captured payment ' || p_payment_id || '. The original order remains in fulfilment.'
-      else 'Review refund for late captured payment ' || p_payment_id || '. Inventory may already have been released.' end;
+      else 'Review refund for captured payment ' || p_payment_id || '. Inventory is unavailable or the order was cancelled.' end;
   end if;
 
   update public.store_orders set
     payment_status = case when v_duplicate and payment_status = 'refunded' then 'refunded' else 'paid' end,
     payment_provider = 'razorpay',
+    gateway_amount_paise = case when v_duplicate then gateway_amount_paise else p_amount_paise end,
     payment_reference = case when v_duplicate then payment_reference else p_payment_id end,
     status = case when v_late then 'cancelled' else status end,
     refund_status = case when v_late or v_duplicate then 'requested' else refund_status end,
@@ -362,8 +497,8 @@ begin
     refund_reason = case when v_late or v_duplicate then v_reason else refund_reason end,
     refund_requested_at = case when v_late or v_duplicate then coalesce(refund_requested_at, now()) else refund_requested_at end,
     refund_resolved_at = case when v_late or v_duplicate then null else refund_resolved_at end,
-    refund_admin_note = case when v_late or v_duplicate then
-      concat_ws(E'\n', nullif(refund_admin_note, ''), v_note)
+    refund_admin_note = case when v_late or v_duplicate
+      then concat_ws(E'\n', nullif(refund_admin_note, ''), v_note)
       else refund_admin_note end,
     updated_at = now()
   where id = v_order.id;
@@ -373,17 +508,19 @@ begin
     execute 'select public.complete_coupon_redemption($1)' using v_order.id;
   end if;
 
-  return jsonb_build_object(
-    'updated', true,
-    'duplicate', false,
-    'refundReview', v_late or v_duplicate,
-    'latePayment', v_late,
-    'duplicatePayment', v_duplicate,
-    'orderId', v_order.id,
-    'orderNumber', v_order.order_number,
-    'total', v_order.total
-  );
+  return jsonb_build_object('updated', true, 'duplicate', false,
+    'refundReview', v_late or v_duplicate, 'latePayment', v_late,
+    'duplicatePayment', v_duplicate, 'stockRestored', v_recover and v_can_recover,
+    'orderId', v_order.id, 'orderNumber', v_order.order_number, 'total', v_order.total);
 end;
+$$;
+
+-- Keep the exact-amount helper used by deployments without customer-paid fees.
+create or replace function public.record_razorpay_capture(
+  p_gateway_order_id text, p_payment_id text, p_amount_paise bigint, p_currency text
+)
+returns jsonb language sql security definer set search_path=public,pg_temp as $$
+  select public.record_razorpay_capture(p_gateway_order_id,p_payment_id,p_amount_paise,p_currency,false,0);
 $$;
 
 -- A short database lease prevents two concurrent requests from creating
@@ -592,6 +729,8 @@ revoke all on function public.create_checkout_order(jsonb,jsonb,text,text,uuid) 
 grant execute on function public.create_checkout_order(jsonb,jsonb,text,text,uuid) to service_role;
 revoke all on function public.fail_checkout_order(uuid,text) from public, anon, authenticated;
 grant execute on function public.fail_checkout_order(uuid,text) to service_role;
+revoke all on function public.record_razorpay_capture(text,text,bigint,text,boolean,integer) from public, anon, authenticated;
+grant execute on function public.record_razorpay_capture(text,text,bigint,text,boolean,integer) to service_role;
 revoke all on function public.record_razorpay_capture(text,text,bigint,text) from public, anon, authenticated;
 grant execute on function public.record_razorpay_capture(text,text,bigint,text) to service_role;
 revoke all on function public.claim_razorpay_order(uuid,text) from public, anon, authenticated;

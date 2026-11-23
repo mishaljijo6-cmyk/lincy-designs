@@ -43,6 +43,7 @@ create table if not exists public.store_orders (
  payment_provider text,
  razorpay_order_id text unique,
  payment_reference text,
+ gateway_amount_paise bigint,
  status text not null default 'new' check (status in ('new','processing','packed','shipped','out_for_delivery','delivered','complete','cancelled')),
  shipping_carrier text,
  tracking_number text,
@@ -54,6 +55,13 @@ create table if not exists public.store_orders (
  refund_requested_at timestamptz,
  refund_resolved_at timestamptz,
  refund_admin_note text,
+ refund_reference text,
+ refund_attempt_key text,
+ refund_payment_reference text,
+ refund_amount_paise bigint,
+ stock_released_at timestamptz,
+ cash_collected_at timestamptz,
+ payment_reconciled_at timestamptz,
  created_at timestamptz not null default now(),
  updated_at timestamptz not null default now()
 );
@@ -73,6 +81,14 @@ alter table public.store_orders add column if not exists refund_reason text;
 alter table public.store_orders add column if not exists refund_requested_at timestamptz;
 alter table public.store_orders add column if not exists refund_resolved_at timestamptz;
 alter table public.store_orders add column if not exists refund_admin_note text;
+alter table public.store_orders add column if not exists refund_reference text;
+alter table public.store_orders add column if not exists refund_attempt_key text;
+alter table public.store_orders add column if not exists refund_payment_reference text;
+alter table public.store_orders add column if not exists refund_amount_paise bigint;
+alter table public.store_orders add column if not exists stock_released_at timestamptz;
+alter table public.store_orders add column if not exists cash_collected_at timestamptz;
+alter table public.store_orders add column if not exists payment_reconciled_at timestamptz;
+alter table public.store_orders add column if not exists gateway_amount_paise bigint;
 create unique index if not exists store_orders_idempotency_key_uidx on public.store_orders(idempotency_key) where idempotency_key is not null;
 create unique index if not exists store_orders_razorpay_order_id_uidx on public.store_orders(razorpay_order_id) where razorpay_order_id is not null;
 
@@ -134,23 +150,42 @@ drop policy if exists "Lincy admin reads order items" on public.store_order_item
 drop policy if exists "Customers read their own orders" on public.store_orders;
 drop policy if exists "Customers read their own order items" on public.store_order_items;
 create policy "Anyone can view active products" on public.store_products for select to anon,authenticated using (active = true);
+create or replace function public.is_lincy_admin()
+returns boolean
+language sql stable security definer
+set search_path = pg_catalog, public, auth
+as $$
+  select exists (
+    select 1 from auth.users u
+     where u.id = auth.uid()
+       and u.email_confirmed_at is not null
+       and coalesce(u.raw_app_meta_data->>'store_role', '') = 'admin'
+  );
+$$;
+revoke all on function public.is_lincy_admin() from public, anon;
+grant execute on function public.is_lincy_admin() to authenticated, service_role;
+-- Provision the existing confirmed owner account once; future checks use only
+-- this server-controlled Supabase app-metadata role.
+update auth.users
+   set raw_app_meta_data = coalesce(raw_app_meta_data, '{}'::jsonb) || '{"store_role":"admin"}'::jsonb
+ where lower(email) = 'mishalmj03@gmail.com'
+   and email_confirmed_at is not null
+   and raw_app_meta_data->>'store_role' is distinct from 'admin';
+
 create policy "Lincy admin manages products" on public.store_products for all to authenticated
-using ((auth.jwt() ->> 'email') = 'mishalmj03@gmail.com')
-with check ((auth.jwt() ->> 'email') = 'mishalmj03@gmail.com');
+using (public.is_lincy_admin())
+with check (public.is_lincy_admin());
 create policy "Lincy admin reads orders" on public.store_orders for select to authenticated
-using ((auth.jwt() ->> 'email') = 'mishalmj03@gmail.com');
-create policy "Lincy admin updates orders" on public.store_orders for update to authenticated
-using ((auth.jwt() ->> 'email') = 'mishalmj03@gmail.com')
-with check ((auth.jwt() ->> 'email') = 'mishalmj03@gmail.com');
+using (public.is_lincy_admin());
 create policy "Lincy admin reads order items" on public.store_order_items for select to authenticated
-using (exists (select 1 from public.store_orders o where o.id = order_id and (auth.jwt() ->> 'email') = 'mishalmj03@gmail.com'));
+using (exists (select 1 from public.store_orders o where o.id = order_id and public.is_lincy_admin()));
 create policy "Customers read their own orders" on public.store_orders for select to authenticated
 using (user_id = auth.uid());
 create policy "Customers read their own order items" on public.store_order_items for select to authenticated
 using (exists (select 1 from public.store_orders o where o.id = order_id and o.user_id = auth.uid()));
 drop policy if exists "Lincy admin reads subscribers" on public.store_subscribers;
 create policy "Lincy admin reads subscribers" on public.store_subscribers for select to authenticated
-using ((auth.jwt() ->> 'email') = 'mishalmj03@gmail.com');
+using (public.is_lincy_admin());
 
 grant select on public.store_products to anon, authenticated;
 grant insert,update,delete on public.store_products to authenticated;
@@ -158,6 +193,18 @@ revoke update on public.store_orders from public,anon,authenticated;
 grant select on public.store_orders to authenticated;
 grant select on public.store_order_items, public.store_subscribers to authenticated;
 grant all on public.store_products, public.store_orders, public.store_order_items, public.store_subscribers to service_role;
+
+create or replace function public.cleanup_store_api_rate_limits()
+returns integer language plpgsql security definer set search_path=public,pg_temp as $$
+declare v_deleted integer;
+begin
+  delete from public.store_api_rate_limits where updated_at < now() - interval '90 days';
+  get diagnostics v_deleted = row_count;
+  return v_deleted;
+end;
+$$;
+revoke all on function public.cleanup_store_api_rate_limits() from public,anon,authenticated;
+grant execute on function public.cleanup_store_api_rate_limits() to service_role;
 
 -- Checkout is called only by the private Vercel API using the Supabase service role.
 create or replace function public.create_checkout_order(p_customer jsonb, p_items jsonb, p_provider text, p_idempotency_key text, p_user_id uuid)
@@ -220,7 +267,7 @@ begin
     select * into v_product from public.store_products where id = v_item->>'productId' and active = true for update;
     if not found then raise exception 'A selected product is unavailable'; end if;
     if v_product.stock < v_qty then raise exception 'Insufficient stock for %', v_product.name; end if;
-    if coalesce(v_item->>'size','') <> '' and not (v_item->>'size' = any(v_product.sizes)) then raise exception 'Invalid size'; end if;
+    if lower(trim(coalesce(v_item->>'size',''))) not in ('','one size') and not (trim(v_item->>'size') = any(v_product.sizes)) then raise exception 'Invalid size'; end if;
     if coalesce(v_item->>'color','') <> '' and not (v_item->>'color' = any(v_product.colors)) then raise exception 'Invalid color'; end if;
     update public.store_products set stock = stock - v_qty where id = v_product.id;
     v_subtotal := v_subtotal + v_product.price * v_qty;
@@ -239,25 +286,59 @@ begin
     v_qty := (v_item->>'quantity')::integer;
     v_tax_rate := case when v_product.price <= 2500 then 5 else 18 end;
     insert into public.store_order_items(order_id,product_id,product_name,unit_price,quantity,gst_rate,gst_amount,selected_size,selected_color,image_url)
-    values(v_order_id,v_product.id,v_product.name,v_product.price,v_qty,v_tax_rate,round((v_product.price::numeric * v_qty * v_tax_rate) / (100 + v_tax_rate))::integer,nullif(v_item->>'size',''),nullif(v_item->>'color',''),v_product.image_url);
+    values(v_order_id,v_product.id,v_product.name,v_product.price,v_qty,v_tax_rate,round((v_product.price::numeric * v_qty * v_tax_rate) / (100 + v_tax_rate))::integer,nullif(case when lower(trim(coalesce(v_item->>'size','')))='one size' then '' else trim(coalesce(v_item->>'size','')) end,''),nullif(v_item->>'color',''),v_product.image_url);
   end loop;
   select * into v_order from public.store_orders where id=v_order_id;
   return jsonb_build_object('id',v_order.id,'order_number',v_order.order_number,'subtotal',v_order.subtotal,'gst_amount',v_order.gst_amount,'total',v_order.total,'shipping',v_order.shipping,'payment_status',v_order.payment_status,'payment_provider',v_order.payment_provider);
 end;
 $$;
 
-drop function if exists public.fail_checkout_order(uuid,text);
-create function public.fail_checkout_order(p_order_id uuid, p_razorpay_order_id text default null)
-returns boolean language plpgsql security definer set search_path=public,pg_temp as $$
-declare v_order public.store_orders%rowtype; v_line record;
+create or replace function public.fail_checkout_order(
+  p_order_id uuid,
+  p_razorpay_order_id text default null
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_order public.store_orders%rowtype;
+  v_line record;
 begin
-  select * into v_order from public.store_orders where id=p_order_id for update;
-  if not found or v_order.payment_status <> 'pending' then return false; end if;
-  if p_razorpay_order_id is not null and v_order.razorpay_order_id is distinct from p_razorpay_order_id then return false; end if;
-  update public.store_orders set payment_status='failed' where id=v_order.id;
-  for v_line in select product_id,quantity from public.store_order_items where order_id=v_order.id and product_id is not null loop
-    update public.store_products set stock=stock+v_line.quantity where id=v_line.product_id;
+  select * into v_order from public.store_orders where id = p_order_id for update;
+  if not found or v_order.payment_status <> 'pending' or v_order.stock_released_at is not null then
+    return false;
+  end if;
+  if p_razorpay_order_id is not null
+     and v_order.razorpay_order_id is distinct from p_razorpay_order_id then
+    return false;
+  end if;
+  -- Once an online order exists, only the reconciler may expire it after the
+  -- reservation window. Explicit customer cancellation uses its own RPC after
+  -- the API confirms Razorpay has no live/captured payment.
+  if v_order.payment_provider = 'razorpay'
+     and v_order.razorpay_order_id is not null
+     and v_order.created_at > now() - interval '45 minutes' then
+    return false;
+  end if;
+
+  update public.store_orders
+     set payment_status = 'failed', stock_released_at = now(),
+         razorpay_order_creation_token = null,
+         razorpay_order_creating_at = null,
+         updated_at = now()
+   where id = v_order.id;
+  for v_line in
+    select product_id, quantity from public.store_order_items
+     where order_id = v_order.id and product_id is not null
+  loop
+    update public.store_products set stock = stock + v_line.quantity
+     where id = v_line.product_id;
   end loop;
+  if to_regprocedure('public.release_coupon_redemption(uuid)') is not null then
+    perform public.release_coupon_redemption(v_order.id);
+  end if;
   return true;
 end;
 $$;
@@ -267,7 +348,7 @@ returns integer language plpgsql security definer set search_path=public,pg_temp
 declare v_order record; v_line record; v_count integer:=0;
 begin
   for v_order in select id from public.store_orders where payment_status='pending' and razorpay_order_id is null and created_at < now()-interval '45 minutes' for update skip locked loop
-    update public.store_orders set payment_status='failed' where id=v_order.id;
+    update public.store_orders set payment_status='failed', stock_released_at=now() where id=v_order.id;
     for v_line in select product_id,quantity from public.store_order_items where order_id=v_order.id and product_id is not null loop
       update public.store_products set stock=stock+v_line.quantity where id=v_line.product_id;
     end loop;

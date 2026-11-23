@@ -1,4 +1,3 @@
-const ADMIN_EMAIL = 'mishalmj03@gmail.com';
 const $ = selector => document.querySelector(selector);
 const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
 const money = value => `₹${Number(value || 0).toLocaleString('en-IN')}`;
@@ -6,6 +5,16 @@ const supabaseClient = window.supabase?.createClient && window.LINCY_SUPABASE_UR
   ? window.supabase.createClient(window.LINCY_SUPABASE_URL, window.LINCY_SUPABASE_PUBLISHABLE_KEY, { auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true } })
   : null;
 let products = [], orders = [], orderItems = [], coupons = [], activeTab = 'products', orderFeaturesReady = false;
+const ORDER_STATUS_FLOW = {
+  new: ['processing', 'packed', 'cancelled'],
+  processing: ['packed', 'cancelled'],
+  packed: ['shipped', 'cancelled'],
+  shipped: ['out_for_delivery', 'delivered'],
+  out_for_delivery: ['delivered'],
+  delivered: ['complete'],
+  complete: [],
+  cancelled: []
+};
 
 function message(target, text, error = false) {
   const el = $(target);
@@ -25,10 +34,11 @@ function showOrderMigrationNotice() {
   el.setAttribute('role', 'alert');
   el.replaceChildren(document.createTextNode('Order ownership, shipment updates, and refund review are not enabled in this database yet. Apply the SQL migration in Supabase, then refresh: '));
   const link = document.createElement('a');
-  link.href = '/migration-orders-and-checkout.sql';
-  link.download = 'migration-orders-and-checkout.sql';
+  link.href = 'https://github.com/mishaljijo6-cmyk/lincy-designs/blob/codex/checkout-mobile-order-fixes/migration-orders-and-checkout.sql';
+  link.target = '_blank';
+  link.rel = 'noopener noreferrer';
   link.textContent = 'download the order database update';
-  el.append(link, document.createTextNode('.'));
+  el.append(link, document.createTextNode(' in the repository SQL files, then refresh this page.'));
 }
 function orderSaveError(error) {
   const text = error?.message || 'The order update could not be saved.';
@@ -45,7 +55,7 @@ function safeTrackingUrl(value) {
   try { const url = new URL(value); return url.protocol === 'https:' ? url.href : ''; } catch { return ''; }
 }
 function toggleView(user) {
-  const login = $('#adminLogin'), dashboard = $('#adminDashboard'), isAdmin = !!user && user.email?.toLowerCase() === ADMIN_EMAIL;
+  const login = $('#adminLogin'), dashboard = $('#adminDashboard'), isAdmin = !!user && !!(user.email_confirmed_at || user.confirmed_at) && user.app_metadata?.store_role === 'admin';
   login.classList.toggle('hidden', isAdmin);
   dashboard.classList.toggle('hidden', !isAdmin);
   if (isAdmin) { $('#adminIdentity').textContent = user.email; refreshDashboard(); }
@@ -60,7 +70,7 @@ async function refreshDashboard() {
   ]);
   if (productResult.error || orderResult.error) {
     message('#dashboardMessage', productResult.error?.message || orderResult.error?.message || 'Could not load the store.', true);
-    return;
+    return false;
   }
   products = productResult.data || [];
   orders = orderResult.data || [];
@@ -70,16 +80,17 @@ async function refreshDashboard() {
     if (result.error) {
       orderItems = [];
       message('#dashboardMessage', 'Order totals loaded, but item details could not be read. Check the store_order_items admin read policy.', true);
-      return;
+      return false;
     }
     orderItems = result.data || [];
   } else orderItems = [];
-  const schemaCheck = await supabaseClient.from('store_orders').select('user_id,customer_note,shipping_carrier,tracking_number,refund_status').limit(1);
+  const schemaCheck = await supabaseClient.from('store_orders').select('user_id,customer_note,shipping_carrier,tracking_number,refund_status,cash_collected_at').limit(1);
   orderFeaturesReady = !schemaCheck.error;
   $('#stats').innerHTML = `<div><small>PRODUCTS</small><b>${products.length}</b></div><div><small>ORDERS</small><b>${orders.length}</b></div><div><small>TO FULFIL</small><b>${orders.filter(order => ['paid', 'cod'].includes(order.payment_status) && !['complete', 'delivered', 'cancelled'].includes(order.status) && order.refund_status !== 'processed').length}</b></div>`;
   if (orderFeaturesReady) message('#dashboardMessage', '');
   else showOrderMigrationNotice();
   renderAdminContent();
+  return true;
 }
 
 function renderProducts() {
@@ -134,14 +145,14 @@ async function renderCoupons() {
     syncCouponValue();
   } catch (error) {
     if (activeTab !== 'coupons') return;
-    root.innerHTML = `<p class="admin-migration-required">${escapeHtml(error.message)} <a href="/migration-coupons.sql" download>Download the coupon database update</a> and run it in Supabase SQL Editor.</p>`;
+    root.innerHTML = `<p class="admin-migration-required">${escapeHtml(error.message)} <a href="https://github.com/mishaljijo6-cmyk/lincy-designs/blob/codex/checkout-mobile-order-fixes/migration-coupons.sql" target="_blank" rel="noopener noreferrer">Open the coupon database update</a> in the repository, run it in Supabase SQL Editor, then refresh.</p>`;
   }
 }
 
 function renderOrders() {
-  const statusOptions = [['new', 'New'], ['processing', 'Processing'], ['packed', 'Packed'], ['shipped', 'Shipped'], ['out_for_delivery', 'Out for delivery'], ['delivered', 'Delivered'], ['complete', 'Delivered (legacy)'], ['cancelled', 'Cancelled']];
+  const allStatusOptions = [['new', 'New'], ['processing', 'Processing'], ['packed', 'Packed'], ['shipped', 'Shipped'], ['out_for_delivery', 'Out for delivery'], ['delivered', 'Delivered'], ['complete', 'Delivered (legacy)'], ['cancelled', 'Cancelled']];
   const refundOptions = [['none', 'No request'], ['requested', 'Requested'], ['approved', 'Approved'], ['rejected', 'Rejected'], ['processed', 'Processed']];
-  const migrationNotice = orderFeaturesReady ? '' : '<p class="admin-migration-required">Tracking, customer notes, and refund changes are paused until the order database update is applied. <a href="/migration-orders-and-checkout.sql" download>Download the SQL update</a>, run it in Supabase SQL Editor, then reload this page.</p>';
+  const migrationNotice = orderFeaturesReady ? '' : '<p class="admin-migration-required">Tracking, customer notes, and refund changes are paused until the order database update is applied. <a href="https://github.com/mishaljijo6-cmyk/lincy-designs/blob/codex/checkout-mobile-order-fixes/migration-orders-and-checkout.sql" target="_blank" rel="noopener noreferrer">Open the SQL update</a> in the repository, run it in Supabase SQL Editor, then reload this page.</p>';
   const settled = order => ['paid', 'cod'].includes(order.payment_status);
   const completedOrders = orders.filter(order => settled(order) && ['complete', 'delivered'].includes(order.status));
   const fulfilOrders = orders.filter(order => settled(order) && !['complete', 'delivered', 'cancelled'].includes(order.status) && order.refund_status !== 'processed');
@@ -150,16 +161,19 @@ function renderOrders() {
   const assigned = new Set([...completedOrders, ...fulfilOrders, ...failedOrders, ...awaitingOrders].map(order => order.id));
   const otherOrders = orders.filter(order => !assigned.has(order.id));
   const renderOrderCard = order => {
+    const currentStatus = order.status || 'new';
+    const allowedStatuses = ORDER_STATUS_FLOW[currentStatus] || [];
+    const statusOptions = allStatusOptions.filter(([value]) => value === currentStatus || allowedStatuses.includes(value));
     const items = orderItems.filter(item => item.order_id === order.id);
     const trackUrl = safeTrackingUrl(order.tracking_url);
     const canIssueRazorpayRefund = order.payment_provider === 'razorpay' && order.payment_status === 'paid';
     const canRecordCodRefund = order.payment_provider === 'cod' && order.payment_status === 'cod';
     const refundAmount = (Number(order.refund_amount_paise || 0) || Math.round(Number(order.total || 0) * 100)) / 100;
-    const itemMarkup = items.map(item => `<div class="admin-order-item"><img src="${escapeHtml(item.image_url || '')}" alt="" loading="lazy"><div><b>${escapeHtml(item.product_name)}</b><small>${escapeHtml(item.selected_size || 'One size')} · ${escapeHtml(item.selected_color || '—')} · Qty ${Number(item.quantity)}</small><small>Unit ${money(item.unit_price)} · GST ${Number(item.gst_rate || 0)}% (${money(item.gst_amount)})</small></div><strong>${money(Number(item.unit_price) * Number(item.quantity))}</strong></div>`).join('') || '<p class="admin-order-muted">No saved line items. Apply the latest checkout database update for new orders.</p>';
+    const itemMarkup = items.map(item => `<div class="admin-order-item"><img src="${escapeHtml(item.image_url || '')}" alt="" loading="lazy"><div><b>${escapeHtml(item.product_name)}</b><small>${escapeHtml(item.selected_size || 'One size')} · ${escapeHtml(item.selected_color || '—')} · Qty ${Number(item.quantity)}</small><small>Unit ${money(item.unit_price)}</small></div><strong>${money(Number(item.unit_price) * Number(item.quantity))}</strong></div>`).join('') || '<p class="admin-order-muted">No saved line items. Apply the latest checkout database update for new orders.</p>';
     return `<details class="admin-order-card"><summary><span><b>${escapeHtml(order.order_number)}</b><small>${escapeHtml(order.customer_name)} · ${formatDate(order.created_at)}</small></span><span>${money(order.total)}<small>${escapeHtml(order.payment_status)} · ${escapeHtml(order.payment_provider || '—')}</small></span><span class="admin-order-status">${escapeHtml(String(order.status || 'new').replaceAll('_', ' '))}</span><span class="admin-order-chevron" aria-hidden="true">⌄</span></summary><div class="admin-order-body">
-      <div class="admin-order-columns"><section><h3>Customer & delivery</h3><p><b>${escapeHtml(order.customer_name)}</b><br><a href="mailto:${escapeHtml(order.email)}">${escapeHtml(order.email)}</a><br><a href="tel:${escapeHtml(order.phone)}">${escapeHtml(order.phone)}</a></p><p>${escapeHtml(order.address)}<br>${escapeHtml(order.city)}, ${escapeHtml(order.state)} ${escapeHtml(order.pincode)}</p><small>Placed ${formatDate(order.created_at)}</small>${order.customer_note ? `<p><b>Customer order note</b><br>${escapeHtml(order.customer_note)}</p>` : '<p class="admin-order-muted">No order note provided.</p>'}</section><section><h3>Payment & amount</h3><dl class="admin-order-prices"><div><dt>Items (GST included)</dt><dd>${money(order.subtotal)}</dd></div><div><dt>GST included</dt><dd>${money(order.gst_amount)}</dd></div>${order.coupon_code && Number(order.discount_amount) ? `<div><dt>Coupon (${escapeHtml(order.coupon_code)})</dt><dd>−${money(order.discount_amount)}</dd></div>` : ''}<div><dt>Delivery</dt><dd>${Number(order.shipping) ? money(order.shipping) : 'Free'}</dd></div>${Number(order.delivery_discount) ? `<div><dt>Free delivery coupon (${escapeHtml(order.coupon_code)})</dt><dd>−${money(order.delivery_discount)}</dd></div>` : ''}<div class="total"><dt>Total</dt><dd>${money(order.total)}</dd></div></dl><p><b>${escapeHtml(order.payment_provider || '—')}</b> · ${escapeHtml(order.payment_status)}<br>Reference: ${escapeHtml(order.payment_reference || 'Not paid yet')}${order.refund_payment_reference?`<br>Payment needing refund: ${escapeHtml(order.refund_payment_reference)}`:''}${order.refund_reference?`<br>Refund reference: ${escapeHtml(order.refund_reference)} · ${money(Number(order.refund_amount_paise||0)/100)}`:''}</p></section></div>
+      <div class="admin-order-columns"><section><h3>Customer & delivery</h3><p><b>${escapeHtml(order.customer_name)}</b><br><a href="mailto:${escapeHtml(order.email)}">${escapeHtml(order.email)}</a><br><a href="tel:${escapeHtml(order.phone)}">${escapeHtml(order.phone)}</a></p><p>${escapeHtml(order.address)}<br>${escapeHtml(order.city)}, ${escapeHtml(order.state)} ${escapeHtml(order.pincode)}</p><small>Placed ${formatDate(order.created_at)}</small>${order.customer_note ? `<p><b>Customer order note</b><br>${escapeHtml(order.customer_note)}</p>` : '<p class="admin-order-muted">No order note provided.</p>'}</section><section><h3>Payment & amount</h3><dl class="admin-order-prices"><div><dt>Items subtotal</dt><dd>${money(order.subtotal)}</dd></div>${order.coupon_code && Number(order.discount_amount) ? `<div><dt>Coupon (${escapeHtml(order.coupon_code)})</dt><dd>−${money(order.discount_amount)}</dd></div>` : ''}<div><dt>Delivery</dt><dd>${Number(order.shipping) ? money(order.shipping) : 'Free'}</dd></div>${Number(order.delivery_discount) ? `<div><dt>Free delivery coupon (${escapeHtml(order.coupon_code)})</dt><dd>−${money(order.delivery_discount)}</dd></div>` : ''}${Number(order.gateway_amount_paise)>Math.round(Number(order.total)*100)?`<div><dt>Razorpay convenience fee</dt><dd>${money((Number(order.gateway_amount_paise)-Math.round(Number(order.total)*100))/100)}</dd></div>`:''}<div class="total"><dt>Store order total</dt><dd>${money(order.total)}</dd></div>${Number(order.gateway_amount_paise)>0?`<div><dt>Total paid to Razorpay</dt><dd>${money(Number(order.gateway_amount_paise)/100)}</dd></div>`:''}</dl><p><b>${escapeHtml(order.payment_provider || '—')}</b> · ${escapeHtml(order.payment_status)}<br>Reference: ${escapeHtml(order.payment_reference || 'Not paid yet')}${order.refund_payment_reference?`<br>Payment needing refund: ${escapeHtml(order.refund_payment_reference)}`:''}${order.refund_reference?`<br>Refund reference: ${escapeHtml(order.refund_reference)} · ${money(Number(order.refund_amount_paise||0)/100)}`:''}</p></section></div>
       <section class="admin-order-lines"><h3>Items (${items.length})</h3>${itemMarkup}</section>
-      <div class="admin-order-columns admin-order-management"><section><h3>Fulfilment & tracking</h3><label>Order status<select data-status="${escapeHtml(order.id)}" ${orderFeaturesReady ? '' : 'disabled'}>${statusOptions.map(([value, label]) => `<option value="${value}" ${order.status === value ? 'selected' : ''}>${label}</option>`).join('')}</select></label><form class="admin-tracking-form" data-tracking="${escapeHtml(order.id)}"><label>Carrier<input name="carrier" maxlength="80" value="${escapeHtml(order.shipping_carrier || '')}" placeholder="Courier or delivery service" ${orderFeaturesReady ? '' : 'disabled'}></label><label>Tracking number<input name="trackingNumber" maxlength="120" value="${escapeHtml(order.tracking_number || '')}" placeholder="Tracking ID" ${orderFeaturesReady ? '' : 'disabled'}></label><label>Tracking link<input name="trackingUrl" type="url" value="${escapeHtml(order.tracking_url || '')}" placeholder="https://…" ${orderFeaturesReady ? '' : 'disabled'}></label><div class="admin-form-feedback" aria-live="polite"></div><button class="button outline" type="submit" ${orderFeaturesReady ? '' : 'disabled'}>Save tracking</button></form><p class="admin-order-muted">Shipped: ${formatDate(order.shipped_at)} · Delivered: ${formatDate(order.delivered_at)}</p>${trackUrl ? `<a href="${escapeHtml(trackUrl)}" target="_blank" rel="noopener noreferrer">Open tracking page ↗</a>` : ''}</section><section><h3>Refund request</h3><p><b>${escapeHtml(order.refund_status || 'none')}</b>${order.refund_reason ? `<br>Customer refund comment: ${escapeHtml(order.refund_reason)}` : ''}<br>Requested: ${formatDate(order.refund_requested_at)}</p><form class="admin-refund-form" data-refund="${escapeHtml(order.id)}"><label>Review status<select name="refundStatus" ${orderFeaturesReady ? '' : 'disabled'}>${refundOptions.map(([value, label]) => `<option value="${value}" ${(order.refund_status || 'none') === value ? 'selected' : ''}>${label}</option>`).join('')}</select></label>${canIssueRazorpayRefund || canRecordCodRefund ? `<label>Refund amount (₹)<input name="refundAmount" type="number" min="1" max="${Number(order.total || 0)}" step="0.01" value="${refundAmount}" ${orderFeaturesReady ? '' : 'disabled'}></label>` : ''}<label>Note for customer<textarea name="adminNote" rows="3" maxlength="1000" ${orderFeaturesReady ? '' : 'disabled'}>${escapeHtml(order.refund_admin_note || '')}</textarea></label><label class="admin-refund-confirm"><input type="checkbox" name="markRefunded" ${orderFeaturesReady ? '' : 'disabled'}> ${canIssueRazorpayRefund ? 'I approve submitting this refund to Razorpay now' : canRecordCodRefund ? 'I have returned this cash refund to the customer' : 'No cash payment was collected for this order'}</label><div class="admin-form-feedback" aria-live="polite"></div><button class="button outline" type="submit" ${orderFeaturesReady ? '' : 'disabled'}>Save refund review</button></form><small class="admin-order-muted">${canIssueRazorpayRefund ? 'Saving as Processed submits one idempotent refund to Razorpay. Partial amounts are supported; Razorpay confirms the final status by webhook.' : canRecordCodRefund ? 'Return the cash separately before saving this refund as Processed.' : 'Coupon-covered orders have no captured amount to refund.'}</small></section></div>
+      <div class="admin-order-columns admin-order-management"><section><h3>Fulfilment & tracking</h3><label>Order status<select data-status="${escapeHtml(order.id)}" ${orderFeaturesReady ? '' : 'disabled'}>${statusOptions.map(([value, label]) => `<option value="${value}" ${order.status === value ? 'selected' : ''}>${label}</option>`).join('')}</select></label>${order.payment_provider === 'cod' && order.payment_status === 'cod' && ['out_for_delivery','delivered','complete'].includes(currentStatus) ? `<p class="admin-cash-collected"><button class="button outline" type="button" data-cash-collected="${escapeHtml(order.id)}" ${orderFeaturesReady && !order.cash_collected_at ? '' : 'disabled'}>${order.cash_collected_at ? `Cash collected ${formatDate(order.cash_collected_at)}` : 'Mark cash collected'}</button></p>` : ''}<form class="admin-tracking-form" data-tracking="${escapeHtml(order.id)}"><label>Carrier<input name="carrier" maxlength="80" value="${escapeHtml(order.shipping_carrier || '')}" placeholder="Courier or delivery service" ${orderFeaturesReady ? '' : 'disabled'}></label><label>Tracking number<input name="trackingNumber" maxlength="120" value="${escapeHtml(order.tracking_number || '')}" placeholder="Tracking ID" ${orderFeaturesReady ? '' : 'disabled'}></label><label>Tracking link<input name="trackingUrl" type="url" value="${escapeHtml(order.tracking_url || '')}" placeholder="https://…" ${orderFeaturesReady ? '' : 'disabled'}></label><div class="admin-form-feedback" aria-live="polite"></div><button class="button outline" type="submit" ${orderFeaturesReady ? '' : 'disabled'}>Save tracking</button></form><p class="admin-order-muted">Shipped: ${formatDate(order.shipped_at)} · Delivered: ${formatDate(order.delivered_at)}</p>${trackUrl ? `<a href="${escapeHtml(trackUrl)}" target="_blank" rel="noopener noreferrer">Open tracking page ↗</a>` : ''}</section><section><h3>Refund request</h3><p><b>${escapeHtml(order.refund_status || 'none')}</b>${order.refund_reason ? `<br>Customer refund comment: ${escapeHtml(order.refund_reason)}` : ''}<br>Requested: ${formatDate(order.refund_requested_at)}</p><form class="admin-refund-form" data-refund="${escapeHtml(order.id)}"><label>Review status<select name="refundStatus" ${orderFeaturesReady ? '' : 'disabled'}>${refundOptions.map(([value, label]) => `<option value="${value}" ${(order.refund_status || 'none') === value ? 'selected' : ''}>${label}</option>`).join('')}</select></label>${canIssueRazorpayRefund || canRecordCodRefund ? `<label>Refund amount (₹)<input name="refundAmount" type="number" min="1" max="${Number(order.total || 0)}" step="0.01" value="${refundAmount}" ${orderFeaturesReady ? '' : 'disabled'}></label>` : ''}<label>Note for customer<textarea name="adminNote" rows="3" maxlength="1000" ${orderFeaturesReady ? '' : 'disabled'}>${escapeHtml(order.refund_admin_note || '')}</textarea></label><label class="admin-refund-confirm"><input type="checkbox" name="markRefunded" ${orderFeaturesReady ? '' : 'disabled'}> ${canIssueRazorpayRefund ? 'I approve submitting this refund to Razorpay now' : canRecordCodRefund ? 'I have returned this cash refund to the customer' : 'No cash payment was collected for this order'}</label><div class="admin-form-feedback" aria-live="polite"></div><button class="button outline" type="submit" ${orderFeaturesReady ? '' : 'disabled'}>Save refund review</button></form><small class="admin-order-muted">${canIssueRazorpayRefund ? 'Saving as Processed submits one idempotent refund to Razorpay. Partial amounts are supported; Razorpay confirms the final status by webhook.' : canRecordCodRefund ? 'Return the cash separately before saving this refund as Processed.' : 'Coupon-covered orders have no captured amount to refund.'}</small></section></div>
     </div></details>`;
 
   };
@@ -277,13 +291,20 @@ $('#adminLoginForm').onsubmit = async event => {
   const { data, error } = await supabaseClient.auth.signInWithPassword({ email: String(form.get('email')).trim(), password: String(form.get('password')) });
   button.disabled = false; button.textContent = 'Sign in securely';
   if (error) { message('#adminLoginMessage', 'Check your user ID and password, then try again.', true); return; }
-  if (data.user?.email?.toLowerCase() !== ADMIN_EMAIL) { await supabaseClient.auth.signOut(); message('#adminLoginMessage', 'This account is not allowed to manage the store.', true); }
+  if (!(data.user?.email_confirmed_at || data.user?.confirmed_at) || data.user?.app_metadata?.store_role !== 'admin') { await supabaseClient.auth.signOut(); message('#adminLoginMessage', 'This confirmed account is not enabled for store administration.', true); }
 };
 
 $('#adminSignOut').onclick = () => supabaseClient?.auth.signOut();
 $('#newProduct').onclick = () => openEditor();
 
 document.addEventListener('click', async event => {
+  const cashCollected = event.target.closest('[data-cash-collected]');
+  if (cashCollected) {
+    cashCollected.disabled = true;
+    try { await adminOrderRequest(cashCollected.dataset.cashCollected, 'cash-collected', {}); await refreshDashboard(); toast('Cash collection recorded'); }
+    catch (error) { message('#dashboardMessage', error.message, true); cashCollected.disabled = false; }
+    return;
+  }
   const edit = event.target.closest('[data-edit]'), remove = event.target.closest('[data-delete]'), tab = event.target.closest('[data-tab]'), couponEdit = event.target.closest('[data-coupon-edit]'), couponToggle = event.target.closest('[data-coupon-toggle]'), couponDelete = event.target.closest('[data-coupon-delete]');
   if (edit) { openEditor(products.find(product => product.id === edit.dataset.edit)); return; }
   if (remove) {
@@ -332,8 +353,18 @@ document.addEventListener('change', async event => {
   const previousStatus = orders.find(order => order.id === id)?.status || 'new';
   if (!orderFeaturesReady) { event.target.value = previousStatus; showOrderMigrationNotice(); return; }
   const status = event.target.value;
+  const select = event.target;
+  select.disabled = true;
   try { await adminOrderRequest(id, 'status', { status }); await refreshDashboard(); toast('Order status saved'); }
-  catch (error) { event.target.value = previousStatus; formFeedback(event.target.closest('section'), orderSaveError(error), true); }
+  catch (error) {
+    const detail = orderSaveError(error);
+    const refreshed = await refreshDashboard();
+    message('#dashboardMessage', refreshed
+      ? `${detail} The order list now shows its latest saved status.`
+      : `${detail} Reload the admin page to check the current saved status.`, true);
+  } finally {
+    if (select.isConnected) select.disabled = !orderFeaturesReady;
+  }
 });
 
 document.addEventListener('submit', async event => {

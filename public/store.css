@@ -292,6 +292,7 @@ input,select,textarea,button{max-width:100%}
 .modal,.drawer,.product-detail,.product-detail-copy,.checkout-review,.checkout-payment,.checkout-grid,.customer-order-body{min-width:0}
 @media(max-width:650px){
   .header{width:100%;max-width:100%;padding-inline:6px;gap:0}
+  .header nav{flex-basis:calc(100% + 12px);width:calc(100% + 12px);margin-inline:-6px}
   .header .brand{flex:1 1 auto;min-width:0;max-width:30vw;overflow:hidden}
   .header .brand .lincy-logo,.lincy-logo{width:clamp(78px,26vw,112px);max-width:100%;height:auto;max-height:42px}
   .header-actions{flex:0 0 auto;min-width:0;gap:0}
@@ -357,3 +358,35 @@ input,select,textarea,button{max-width:100%}
 }
 
 .admin-order-list{gap:26px}.admin-order-group{display:grid;gap:10px;min-width:0}.admin-order-group>h2{display:flex;align-items:baseline;gap:10px;margin:0 0 3px;padding-bottom:9px;border-bottom:1px solid var(--line);font:500 25px var(--serif)}.admin-order-group>h2 span{font:500 11px var(--sans);color:var(--muted)}
+
+/* Keep product actions on one consistent tap row on narrow phones. */
+@media(max-width:650px){
+  #productModal .product-actions{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr) 50px;align-items:stretch;gap:8px;width:100%;min-width:0}
+  #productModal .product-actions .button,#productModal .product-actions .wish-detail{box-sizing:border-box;display:flex;align-items:center;justify-content:center;width:100%;min-width:0;height:52px;min-height:52px;margin:0;padding:6px;text-align:center;font-size:clamp(10px,2.8vw,12px);line-height:1.15;white-space:normal}
+  #productModal #addToBag{flex-direction:column;gap:2px}
+  #productModal #addToBag span{font-size:9px;white-space:nowrap}
+  #productModal #buyNow{white-space:normal}
+  #productModal .product-actions .wish-detail{flex-direction:column}
+}
+@media(max-width:360px){
+  #productModal .product-actions{grid-template-columns:minmax(0,1fr) minmax(0,1fr) 44px;gap:5px}
+}
+
+/* Prevent horizontal edge-swipe scrolling while preserving vertical page navigation. */
+html,body{overscroll-behavior-x:none}
+@media(max-width:650px){.drawer{height:100vh;height:100dvh;padding-bottom:calc(16px + env(safe-area-inset-bottom))}.modal:not(#checkoutModal){padding-bottom:calc(16px + env(safe-area-inset-bottom))}#checkoutModal{scroll-padding-bottom:calc(72px + env(safe-area-inset-bottom))}.checkout-step-actions{bottom:0}}
+.customer-order-group{display:grid;gap:10px;min-width:0}.customer-order-group>h3{display:flex;align-items:baseline;justify-content:space-between;margin:18px 0 2px;padding-bottom:9px;border-bottom:1px solid var(--line);font-size:14px}.customer-order-group>h3 span{color:var(--muted);font-size:11px;font-weight:500}
+@media(max-width:650px){.checkout-step-actions{bottom:0;margin:14px -12px calc(-12px - env(safe-area-inset-bottom));padding:10px 12px calc(12px + env(safe-area-inset-bottom));}.customer-order-card summary{grid-template-columns:minmax(0,1fr) auto 14px}.admin-order-card summary{grid-template-columns:minmax(0,1fr) auto 14px}.admin-order-card summary>*{min-width:0;overflow-wrap:anywhere}.admin-order-body{overflow:hidden}.admin-order-columns{min-width:0}.admin-order-columns>section,.admin-order-management{min-width:0}.admin-order-management input,.admin-order-management select,.admin-order-management textarea{box-sizing:border-box;width:100%;min-width:0}.admin-cash-collected button{min-height:44px;max-width:100%;white-space:normal}}
+@media(max-width:650px){.checkout-step-actions{bottom:0;margin:14px -12px calc(-12px - env(safe-area-inset-bottom));padding:10px 12px calc(12px + env(safe-area-inset-bottom));}.customer-order-card summary{grid-template-columns:minmax(0,1fr) auto 14px}.admin-order-card summary{grid-template-columns:minmax(0,1fr) auto 14px}.admin-order-card summary>*{min-width:0;overflow-wrap:anywhere}.admin-order-body{overflow:hidden}.admin-order-columns{min-width:0}.admin-order-columns>section,.admin-order-management{min-width:0}.admin-order-management input,.admin-order-management select,.admin-order-management textarea{box-sizing:border-box;width:100%;min-width:0}.admin-cash-collected button{min-height:44px;max-width:100%;white-space:normal}}
+
+/* Prevent small-screen horizontal page drift across mobile browsers. */
+html,body{max-width:100%;overflow-x:hidden}
+.legal-page{min-height:100vh;background:var(--paper);color:var(--ink)}
+.legal-content{width:min(760px,calc(100% - 40px));margin:clamp(36px,8vw,90px) auto;padding:0 0 55px}
+.legal-content>.text-link{display:inline-block;margin-bottom:36px}
+.legal-content h1{font:clamp(38px,7vw,62px)/1.08 var(--serif);margin:14px 0 26px;overflow-wrap:anywhere}
+.legal-content h2{font:24px var(--serif);margin:32px 0 10px}
+.legal-content p{font-size:14px;line-height:1.8;color:var(--muted);overflow-wrap:anywhere}
+.legal-content .legal-draft{padding:16px 18px;border:1px solid #d59a54;background:#fff7e8;color:#6c4c2d}
+.legal-footer{display:flex;flex-wrap:wrap;gap:14px 24px;padding:20px 6%;border-top:1px solid var(--line);font-size:12px}
+@media(max-width:520px){.legal-content{width:calc(100% - 32px);margin:34px auto;padding-bottom:36px}.legal-content>.text-link{margin-bottom:25px}.legal-footer{gap:12px 16px;padding-bottom:calc(20px + env(safe-area-inset-bottom))}}
